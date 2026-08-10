@@ -37,9 +37,8 @@ entirely (see [Residual risk even with freeze](#residual-risk-even-with-freeze)
 below). This happens **without ever blocking the snapshot from
 happening** - the guiding principle, in the project owner's words:
 
-> mache zfs snapshot mit freeze vm sofern möglich und das so gut wie es
-> eben geht - take the ZFS snapshot with a VM freeze if at all possible,
-> and do it as well as it can be done.
+> take the ZFS snapshot with a VM freeze if at all possible, and do it
+> as well as it can be done.
 
 Concretely: freeze every guest it can, by the best method available for
 that guest, take the snapshot, thaw everything again - and if a guest can't
