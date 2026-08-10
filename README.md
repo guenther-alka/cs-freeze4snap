@@ -9,16 +9,33 @@ Part of the [napp-it CS](https://napp-it.org) cluster tooling family
 
 ## Goal
 
-`zfs snapshot` on its own is only *crash-consistent*: it captures whatever
-happens to be on disk at that instant, the storage-level equivalent of
-pulling the power cord. For a VM or container that's actively writing, that
-can mean a snapshot mid-write - usually fine for journaled filesystems, not
-guaranteed for anything else.
+ZFS's copy-on-write design with atomic transaction-group (txg) commits
+means `zfs snapshot` **can never corrupt the pool itself** - that
+guarantee is absolute, not "usually" or "for most filesystems". A
+snapshot taken mid-write is always a valid, mountable point-in-time
+image of whatever was on disk at that instant.
 
-`cs-freeze4snap` sits in front of `zfs snapshot` and tries to get a better
-consistency guarantee for every Proxmox VM/LXC guest living on the target
-dataset, **without ever blocking the snapshot from happening**. The guiding
-principle, in the project owner's words:
+But that guarantee only covers what ZFS itself can see: the raw bytes
+on the zvol/dataset. **It says nothing about whether those bytes form
+a consistent filesystem from the perspective of an OS running inside a
+VM.** For a VM's virtual disk, a snapshot taken while the guest is
+writing is - from the guest's own point of view - exactly equivalent
+to someone pulling the power cord: whatever was on disk at that
+instant is what the guest sees on next boot, no more, no less. Whether
+that's safe depends entirely on how well the *guest's own* filesystem
+recovers from an unclean shutdown - modern journaled filesystems
+(ext4, XFS, NTFS, ...) handle this well via their own journal replay;
+older or non-journaled filesystems may not.
+
+`cs-freeze4snap` exists specifically to reduce this second, guest-side
+risk - ZFS can't do anything about it on its own, since it has no
+visibility into what's happening inside a running VM. Freezing pauses
+guest I/O (or the whole guest) right before the snapshot, so the
+captured state is a clean stopping point rather than an arbitrary
+mid-write instant - **minimizing** that risk, not eliminating it
+entirely (see [Residual risk even with freeze](#residual-risk-even-with-freeze)
+below). This happens **without ever blocking the snapshot from
+happening** - the guiding principle, in the project owner's words:
 
 > mache zfs snapshot mit freeze vm sofern möglich und das so gut wie es
 > eben geht - take the ZFS snapshot with a VM freeze if at all possible,
@@ -143,6 +160,40 @@ universally available on any Linux host with cgroup v2 - if that write
 itself fails, something is unusual enough (missing cgroup delegation,
 read-only cgroupfs, ...) that it's reported as a Warning like everything
 else, and the snapshot still proceeds as-is.
+
+### Residual risk even with freeze
+
+Freeze **minimizes** the guest-side risk described in [Goal](#goal); it
+does not make it disappear entirely. A few narrow, real cases remain:
+
+- **The guest's own filesystem may not support freezing cleanly.** This
+  is the same class of problem this project already hit on the *host*
+  side (ZFS not supporting `FIFREEZE` - see Test results below), just
+  one layer deeper: if a guest kernel's driver for whatever filesystem
+  is mounted doesn't implement freeze support (rare, mostly very old or
+  exotic filesystems), `guest-fsfreeze-freeze` either fails outright
+  (this tool falls through to QMP pause in that case) or, in principle,
+  could no-op silently on a sufficiently old/broken guest kernel.
+- **Freeze doesn't force applications to persist unwritten state.** It
+  guarantees that whatever an application *has already written* lands
+  atomically and completely - it doesn't make an application write
+  anything it hadn't already decided to. An in-memory cache that hasn't
+  checkpointed yet is gone either way, freeze or not - that's an
+  application design question, not something storage-level tooling can
+  fix.
+- **QMP pause is, if anything, the stronger of the two active
+  strategies**, not the weaker one: it halts all vCPU execution
+  entirely (nothing can start a new write), while QEMU's block layer
+  still drains any I/O that was already in flight before the pause
+  takes effect - eliminating torn-write risk essentially completely.
+  QGA fsfreeze is solid too, but its guarantee is only as good as the
+  guest kernel's own freeze implementation for the specific filesystem
+  involved (see the first bullet above).
+
+None of this is a reason not to freeze - it reduces the guest-side risk
+window from "any write, any time" to "a small set of edge cases", which
+is a large practical improvement. It's just not an absolute guarantee,
+the same way the host-level ZFS guarantee is.
 
 ### Never a hard failure
 
