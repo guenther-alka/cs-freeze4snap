@@ -176,6 +176,46 @@ in this snapshot: nvme480/vm-101-disk-0
 This check is itself best-effort/advisory: if it can't run (e.g.
 permissions), that's logged but doesn't affect the snapshot either.
 
+## Recommended: combine with napp-it CS's config-include feature
+
+If you're driving this tool from [napp-it CS](https://napp-it.org)'s
+`job-snap.pl` (see `--recursive` above), there's a genuinely useful
+combination worth calling out: napp-it CS's snap jobs have their own
+`include=<folders>` feature that syncs regular (non-ZFS) folders into a
+`_include` subfolder of the target dataset *before* the snapshot is
+taken. Pointed at Proxmox's cluster-wide `/etc/pve` (which holds every
+VM/CT's `.conf` file), the execution order becomes:
+
+```
+1. include  → /etc/pve synced into <dataset>/_include/_etc_pve
+2. freeze   → this tool's cascade (QGA/QMP/cgroup) pauses the guests
+3. snapshot → one atomic, recursive zfs snapshot -r captures BOTH
+```
+
+The result: a single snapshot holding the VM/CT **configuration**
+(CPU, RAM, disks, network - whatever was in `/etc/pve` right before the
+freeze window) together with **consistently frozen disk data** for
+every guest under the dataset. Useful for restores where the config
+might have drifted from what's assumed (extra disk added, RAM resized,
+...) since the last time anyone looked.
+
+This only pays off with a **recursive** snapshot covering a whole
+multi-guest dataset in one pass - a non-recursive snapshot (or,
+elsewhere in the napp-it CS ecosystem, several separate non-recursive
+jobs each covering a single zvol of a multi-disk VM) freezes/snapshots
+independently each time, so disks captured in different runs are not
+consistent with each other even though each is individually consistent.
+`/etc/pve` itself is cluster-wide, so even guests whose disks live
+outside this particular dataset still get their current config
+captured by the include step, just without matching frozen disk data
+from this specific run.
+
+Verified end-to-end (see Test results below): a recursive snap job with
+`include=/etc/pve` synced real VM/CT config files into
+`<dataset>/_include/_etc_pve` before freezing, and the resulting
+snapshot was confirmed (via `.zfs/snapshot/.../`) to contain those
+config files alongside the frozen guest disk data.
+
 ## Result format
 
 ```jsonc
@@ -295,6 +335,7 @@ so don't assume either outcome without checking on your own system
 | Neither QGA nor QMP reachable (fake sockets, both absent) | `strategy: "none"`, `status: "ok"` - snapshot still taken, exit code 0 |
 | Same scenario with `--forcefreeze` | `status: "error"`, exit code 1, **no snapshot taken** - confirms the opt-in strict mode works as the inverse of the default |
 | Guest with disks on two pools (`rpool/data` + `nvme480`) | `warnings` correctly flagged the disk outside the targeted dataset |
+| Recursive snap + napp-it CS `include=/etc/pve` combo | `_include/_etc_pve` synced before the freeze; resulting snapshot confirmed (via `.zfs/snapshot/.../`) to contain the VM/CT `.conf` files alongside the frozen guest disk data, all in one atomic recursive snapshot |
 | Snapshot cleanup after every test | Verified via `zfs list -t snapshot` before and after `zfs destroy -r` |
 
 All source files transferred to the test host were verified byte-identical
