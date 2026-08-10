@@ -194,6 +194,28 @@ window from "any write, any time" to "a small set of edge cases", which
 is a large practical improvement. It's just not an absolute guarantee,
 the same way the host-level ZFS guarantee is.
 
+**Aside: what about running ZFS as the guest filesystem too?** A VM
+whose own filesystem is ZFS (e.g. an OmniOS/FreeBSD/Linux guest with a
+ZFS pool on the virtual disk) gets the same COW/atomic-txg guarantee
+one layer down, independent of the host - a snapshot mid-write is,
+again, always a valid point-in-time image, no journal replay needed.
+That's a genuine, structural edge over journaled filesystems even
+*without* freeze - the tradeoff is real too, though: double
+copy-on-write, double checksumming, and generally more resource
+overhead than a single-layer filesystem. **With freeze in the picture,
+that edge narrows substantially.** QMP pause in particular halts guest
+I/O regardless of the guest's filesystem - so a journaled guest FS
+(ext4, XFS, NTFS) freezes essentially as cleanly as ZFS-on-ZFS would.
+What's left is a narrow structural difference outside the freeze
+window itself: ZFS's COW guarantee applies to every write during
+normal operation, not just the frozen instant, where a journaled FS
+could in principle (rarely) still hit a state needing journal replay
+from ordinary operation. In short: ZFS-in-guest without freeze is a
+real crash-safety-for-resource-overhead tradeoff; with freeze, a
+journaled guest filesystem gets close enough to the same safety that
+the choice becomes more about the guest FS's own feature set than
+about consistency risk.
+
 ### Never a hard failure
 
 Regardless of platform, **no freeze problem ever aborts the job** by
