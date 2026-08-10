@@ -93,6 +93,36 @@ detail. For each discovered guest, `cs-freeze4snap` tries progressively
 weaker - but progressively more universally available - freeze strategies,
 and only gives up (gracefully) once none of them work.
 
+### Multiple guests are frozen in parallel, not one after another
+
+When a dataset holds several VMs/containers, all of them are discovered
+and frozen **concurrently** (via goroutines), not sequentially one at a
+time. The tool waits until *every* guest has either frozen successfully
+or been determined unfreezable, and only then fires a single
+`zfs snapshot -r` covering all of them at once - then thaws everyone in
+parallel again.
+
+```
+ discover guests on dataset
+          │
+          ▼
+ freeze VM-A ─┐
+ freeze VM-B ─┼─▶  wait for all  ─▶  ONE zfs snapshot -r  ─▶  thaw all
+ freeze LXC-C ─┘        (parallel)         (atomic)              (parallel)
+```
+
+This matters: freezing guests one at a time would leave a window where
+the first guest is already paused while later guests are still writing
+right up until the (single, shared) snapshot moment - undermining the
+whole point of freezing if the guests interact with each other or share
+external state. Parallel freeze/thaw means every guest under the dataset
+pauses for approximately the same instant, and the snapshot captures that
+shared instant for all of them. In practice this keeps the total freeze
+window short even with several guests - the slowest guest determines how
+long the freeze phase takes, not the sum of all guests (in live testing
+against a real Proxmox host this stayed in the low-millisecond range even
+with a mix of VM/LXC guests using different freeze strategies).
+
 ### VMs (QEMU/KVM under Proxmox)
 
 ```
