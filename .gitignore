@@ -1,3 +1,5 @@
 /cs-freeze4snap
 /cs-freeze4snap.exe
+/cs-freeze4snap-linux-*
+/checksums.sha256
 *.test
