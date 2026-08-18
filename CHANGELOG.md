@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.0 - first stable release
+
+- Promoted from v0.1.0 to v1.0.0: functionality unchanged, marks the
+  release as verified/stable for general use (see v0.1.0 notes below
+  for full feature set).
+
 ## v0.1.0 - initial release
 
 - ZFS dataset snapshot with automatic Proxmox VM/LXC guest discovery
