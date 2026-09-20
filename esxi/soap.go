@@ -339,12 +339,41 @@ func (t *soapTransport) CreateSnapshot(ctx context.Context, vmid int, name, desc
 	}
 	id, err := t.waitTask(ctx, task)
 	if err != nil {
+		if ctx.Err() != nil {
+			t.cancelTask(task) // timed out: do not leave the host busy with a snapshot nobody waits for
+		}
 		return "", err
 	}
 	if id == "" {
 		return "", errors.New("snapshot created but the API returned no snapshot id")
 	}
 	return id, nil
+}
+
+// cancelTask asks the host to abandon a task the client stopped waiting for and
+// waits (a few seconds) until it has. Best effort: not every task is cancelable.
+// Without it a timed-out memory snapshot keeps running on the host and the next
+// step of the chain fails with "Another task is already in progress".
+func (t *soapTransport) cancelTask(task string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if _, err := t.call(ctx, `<CancelTask xmlns="urn:vim25"><_this type="Task">`+xesc(task)+`</_this></CancelTask>`); err != nil {
+		return
+	}
+	for {
+		p, err := t.getProps(ctx, "Task", task, "info.state")
+		if err != nil {
+			return
+		}
+		if st := p["info.state"].text(); st != "running" && st != "queued" {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
 }
 
 func (t *soapTransport) RemoveSnapshot(ctx context.Context, vmid int, snapID string) error {

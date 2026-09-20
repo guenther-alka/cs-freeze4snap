@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeVSphere answers the SOAP calls the transport makes, the way ESXi 8 does.
@@ -26,6 +27,8 @@ type fakeVSphere struct {
 	polled map[string]int
 	next   int
 	uas    []string
+	hang   bool            // tasks stay "running" until cancelled
+	cancel map[string]bool // CancelTask received
 }
 
 const envOpen = `<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soapenv:Body>`
@@ -136,9 +139,24 @@ func (f *fakeVSphere) handle(w http.ResponseWriter, r *http.Request) {
 		task := fmt.Sprintf("haTask-%d-remove", f.next)
 		f.tasks[task] = "-"
 		out(`<RemoveSnapshot_TaskResponse xmlns="urn:vim25"><returnval type="Task">` + task + `</returnval></RemoveSnapshot_TaskResponse>`)
+	case strings.Contains(body, "<CancelTask"):
+		task := regexp.MustCompile(`<_this type="Task">([^<]+)<`).FindStringSubmatch(body)[1]
+		if f.cancel == nil {
+			f.cancel = map[string]bool{}
+		}
+		f.cancel[task] = true
+		out(`<CancelTaskResponse xmlns="urn:vim25"></CancelTaskResponse>`)
 	case strings.Contains(body, `<obj type="Task">`):
 		task := reTaskOb.FindStringSubmatch(body)[1]
 		f.polled[task]++
+		if f.hang {
+			st := "running"
+			if f.cancel[task] {
+				st = "error"
+			}
+			out(`<RetrievePropertiesResponse xmlns="urn:vim25"><returnval><obj type="Task">` + task + `</obj>` + prop("info.state", st) + `</returnval></RetrievePropertiesResponse>`)
+			return
+		}
 		if f.polled[task] == 1 { // first look: still running
 			out(`<RetrievePropertiesResponse xmlns="urn:vim25"><returnval><obj type="Task">` + task + `</obj>` + prop("info.state", "running") + `</returnval></RetrievePropertiesResponse>`)
 			return
@@ -271,5 +289,28 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if err := (&Config{}).Normalize(); err == nil {
 		t.Error("empty config must not validate")
+	}
+}
+
+func TestSOAPTimeoutCancelsTheTask(t *testing.T) {
+	f, c := startFakeVSphere(t)
+	tr, err := Open(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+	f.mu.Lock()
+	f.hang = true
+	f.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 700*time.Millisecond)
+	defer cancel()
+	if _, err := tr.CreateSnapshot(ctx, 10, "cs4s-x-10", "cs-freeze4snap", true, false); err == nil {
+		t.Fatal("a hanging snapshot must time out")
+	}
+	f.mu.Lock()
+	n := len(f.cancel)
+	f.mu.Unlock()
+	if n != 1 {
+		t.Errorf("CancelTask calls: %d", n)
 	}
 }

@@ -312,3 +312,7 @@ func TestCleanupESXiManyVMsKeepsOrder(t *testing.T) {
 		}
 	}
 }
+
+func esxiSnapshot(id, name, desc string) esxi.Snapshot {
+	return esxi.Snapshot{ID: id, Name: name, Desc: desc}
+}

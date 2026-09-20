@@ -30,6 +30,15 @@ type GuestResult struct {
 	// SnapID is the VM snapshot that stands in for the freeze (ESXi): the
 	// handle "thaw" needs to remove it again.
 	SnapID string `json:"snap_id,omitempty"`
+	// Chain is the freeze chain that applied to this guest ("quiesce,memory,zfs,30"),
+	// Strict that it had no zfs fallback: a guest that is not Frozen then aborts the run.
+	Chain  string `json:"chain,omitempty"`
+	Strict bool   `json:"strict,omitempty"`
+}
+
+// chainer is implemented by Freezers that resolve a chain per guest.
+type chainer interface {
+	ChainOf(g Guest) Chain
 }
 
 // noter is optionally implemented by a Freezer that can explain a degraded
@@ -66,6 +75,11 @@ func FreezeAll(guests []Guest, timeout time.Duration) *FreezeSession {
 			res := GuestResult{VMID: g.VMID, Name: g.Name, Type: g.Type, Platform: g.Platform}
 
 			f, err := For(g)
+			ch := ChainFor(g, DefaultChainFor(g.Platform, g.Type))
+			if c, ok := f.(chainer); ok && err == nil {
+				ch = c.ChainOf(g)
+			}
+			res.Chain, res.Strict = ch.String(), ch.Strict()
 			if err != nil {
 				res.Warning = err.Error()
 				mu.Lock()
@@ -79,6 +93,8 @@ func FreezeAll(guests []Guest, timeout time.Duration) *FreezeSession {
 			switch {
 			case err != nil:
 				res.Warning = err.Error()
+			case strategy == StrategyZFSOnly:
+				res.Warning = "no guest freeze (chain: zfs) - ZFS snapshot only"
 			case strategy == StrategyNone:
 				res.Warning = "no freeze method available for this guest - snapshotting as-is (crash-consistent only)"
 			default:

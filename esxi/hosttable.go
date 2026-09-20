@@ -18,7 +18,10 @@ import (
 //	192.168.2.52,root,cert,/etc/keys/esxi52    (explicit OpenSSH private key)
 //
 // The line of the host asked for is used; per-connection options (port, hostkey,
-// tls_sha256, ...) are not part of the table - use a key=value file for those.
+// tls_sha256, ...) are not part of the table: give them as extra lines
+// "192.168.2.48:hostkey=SHA256:..." (proto, port, hostkey, tls_sha256, timeout,
+// useragent), or use a key=value file. Chain lines ([...], host:vm100,...) are
+// skipped here, see policyline.go.
 
 type hostEntry struct {
 	Host, User, Password, Key string
@@ -30,7 +33,7 @@ type hostEntry struct {
 func isHostTable(text string) bool {
 	for _, l := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(strings.TrimPrefix(l, string([]byte{0xEF, 0xBB, 0xBF})))
-		if t == "" || strings.HasPrefix(t, "#") {
+		if t == "" || strings.HasPrefix(t, "#") || isPolicyLine(t) {
 			continue
 		}
 		c, e := strings.Index(t, ","), strings.Index(t, "=")
@@ -44,7 +47,7 @@ func parseHostTable(path, text string) ([]hostEntry, error) {
 	seen := map[string]bool{}
 	for n, l := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(strings.TrimPrefix(l, string([]byte{0xEF, 0xBB, 0xBF})))
-		if t == "" || strings.HasPrefix(t, "#") {
+		if t == "" || strings.HasPrefix(t, "#") || isPolicyLine(t) {
 			continue
 		}
 		f := strings.Split(t, ",")
@@ -143,6 +146,9 @@ func LoadConfigFor(path, host string) (Config, error) {
 			}
 		}
 		c.Key = k
+	}
+	if err := applyHostOptions(path, string(b), e.Host, &c); err != nil {
+		return Config{}, err
 	}
 	return c, nil
 }

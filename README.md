@@ -319,7 +319,7 @@ Verified end-to-end (see Test results below): a recursive snap job with
 snapshot was confirmed (via `.zfs/snapshot/.../`) to contain those
 config files alongside the frozen guest disk data.
 
-## ESXi: hotsnap of all VMs on an NFS datastore (v1.1.0)
+## ESXi: hotsnap of all VMs on an NFS datastore (v1.1.0, chains and auto protocol v1.2.0)
 
 `cs-freeze4snap` can also take the ZFS snapshot of an **NFS export used as an
 ESXi datastore** in a VM-consistent way. It finds the VMs on that NFS itself,
@@ -385,8 +385,15 @@ cs-freeze4snap discover --cfg esxi.cfg --nfs-path /tank/nfs
 ```
 
 `--host <ip>` selects the line (with only one line in the file it can be left out).
-`cert` entries work with `--proto ssh` only (OpenSSH keys, no PuTTY `.ppk`); soap needs a password.
-The same file can serve several tools and jobs - `--proto` (ssh or soap) is chosen per call.
+`cert` entries work with ssh only (OpenSSH keys, no PuTTY `.ppk`); soap needs a password.
+The same file can serve several tools and jobs. Options that belong to one server are extra lines
+`<host>:<option>=<value>` in the same file (v1.2.0): `proto`, `port`, `hostkey`, `tls_sha256`,
+`timeout`, `useragent`, e.g.
+
+```
+192.168.2.48:proto=ssh
+192.168.2.48:hostkey=SHA256:abcd...
+```
 
 **Single-server key=value file** - use it when a server needs more than login data:
 
@@ -394,7 +401,7 @@ The same file can serve several tools and jobs - `--proto` (ssh or soap) is chos
 host=192.168.2.48
 user=root
 password=...              # or CS_ESXI_PASSWORD in the environment - never a command line flag
-proto=ssh                 # ssh (vim-cmd) or soap (vSphere API, port 443)
+proto=auto                # auto (default: soap, ssh if soap cannot be reached), ssh (vim-cmd) or soap (vSphere API, port 443)
 hostkey=SHA256:...        # ssh: pin the host key (the first run prints it in "warnings")
 tls_sha256=...            # soap: pin the certificate (sha256 hex)
 key=/path/id_ed25519      # ssh: OpenSSH private key instead of a password (no PuTTY .ppk)
@@ -413,36 +420,73 @@ connection works but the JSON `warnings` tell you what to pin.
 | speed (16 VMs, measured) | ~12 s to list VMs, ~3 s per snapshot | ~0.2 s to list VMs, ~2 s per snapshot |
 | needs | ssh service on the host | port 443 |
 
-Use soap where possible; ssh is the fallback that always works. The ESXi
+**`--proto auto`** (default since v1.2.0) tries soap first and falls back to ssh when the vSphere API
+cannot be reached (a warning says so). A failed soap *login* is final and not retried over ssh: the same
+credentials would fail again and every failed login counts towards the account lockout of the ESXi host
+(5 failures by default). Entries with `cert` use ssh directly. Use `--proto ssh|soap` or `<host>:proto=` to
+force one. The ESXi
 clock is not used (the tool names snapshots itself), so a wrong host clock does no harm.
 
-### Modes: `--mode`
+### Freeze chains (v1.2.0)
 
-| mode | VM snapshot | when it fails |
-|---|---|---|
-| `quiesce` (default) | disks, guest filesystem quiesced by VMware Tools | falls back to `plain` (a warning says so) |
-| `mem` | disks and RAM (hot snapshot, takes longer) | falls back to `plain` |
-| `plain` | disks only, crash-consistent | the VM is reported not frozen |
+What "freezing" a VM means is a **chain** of steps that are tried from left to right; the first
+step that works wins, the ZFS snapshot is taken afterwards. Every step has its own timeout.
 
-As with Proxmox, a VM that cannot be snapshotted never blocks the ZFS snapshot -
-it is reported in `warnings` (and in `guests[].warning`). `--forcefreeze` aborts
-before the ZFS snapshot instead. Unlike a plain Proxmox run, an unreachable ESXi
-host or a wrong password is treated the same way: the ZFS snapshot is taken
-without VM snapshots and the reason is in `warnings` (with `--forcefreeze` the run
-aborts). The default `--timeout` for ESXi is 120 s per VM (quiesced snapshots take
-their time).
+| step | ESXi | Proxmox VM | Proxmox LXC |
+|---|---|---|---|
+| `quiesce` (alias `freeze`) | VM snapshot, guest filesystem quiesced by VMware Tools | QEMU guest agent `fsfreeze` | `fsfreeze`, else cgroup freeze |
+| `memory` (alias `mem`) | VM snapshot including the RAM state (hot snapshot, slower; restoring it resumes the running state) | - | - |
+| `plain` | VM snapshot of the disks only (crash-consistent) | - | - |
+| `pause` | - | QMP `stop`/`cont` (the whole VM is paused) | - |
+| `zfs` | give up freezing, take the ZFS snapshot as it is | same | same |
+
+Steps that do not exist on a platform are skipped, so one global chain can serve ESXi and Proxmox.
+A number is a timeout in seconds: `memory:300` for one step, a bare number for every step without its
+own. Without a timeout the `--timeout` value applies (30 s, ESXi 120 s).
+
+Chains live in the cfg file next to the server list (or in `--policy`):
+
+```
+[quiesce,memory,zfs,30]              # global default: quiesce, else memory, else ZFS only; 30 s per step
+192.168.2.48:*,quiesce,plain,zfs     # every VM of this ESXi host
+192.168.2.48:vm100,memory,zfs        # one VM (vm100, ct100 or 100)
+192.168.2.203:vm101,quiesce,memory   # Proxmox member, no zfs at the end -> strict
+```
+
+Precedence (strongest first): `--mode`, `--policy`, `host:vmid` line, `host:*` line, global `[...]`,
+built-in default (ESXi `quiesce,plain,zfs`, Proxmox VM `quiesce,pause,zfs`, LXC `quiesce,zfs`).
+`--mode quiesce|mem|plain` stays as a shortcut for one chain for all VMs (`quiesce,plain,zfs` /
+`memory,plain,zfs` / `plain,zfs`). `--policy` (repeatable) takes the same lines without the host prefix:
+`--policy '[quiesce,memory,zfs,30]' --policy 'vm100,memory,zfs'`.
+
+**Best effort or strict.** A chain that ends with `zfs` is best effort as before: when every step failed
+the guest is reported not frozen (`guests[].warning`) and the ZFS snapshot is taken anyway. A chain
+**without** `zfs` is strict for its guests: if no step works the run aborts *before* the ZFS snapshot
+(exit 1, `status: error`), like `--forcefreeze` but per guest. A chain of only `zfs` takes no VM snapshot
+at all for that guest (strategy `zfs-only`).
+
+**Timeouts.** A step that runs out of time counts as failed and the next step starts. For ESXi the tool
+then removes a snapshot that the host may still have created for the failed step (the host can finish a
+task after the client gave up); if that fails the warning says to run `cleanup`. For Proxmox the timeout
+bounds each connection/command of the step. The JSON result shows the chain that applied in
+`guests[].chain`.
+
+As with Proxmox, a VM that cannot be snapshotted never blocks the ZFS snapshot (unless strict) -
+it is reported in `warnings`. An unreachable ESXi host or a wrong password is treated the same way:
+the ZFS snapshot is taken without VM snapshots and the reason is in `warnings` (with `--forcefreeze` the run
+aborts).
 
 The VM snapshots are named `cs4s-<snapshot>-<vmid>` and carry the description
 `cs-freeze4snap`; only such snapshots are ever removed by the tool.
 
 ### Use from napp-it CS jobs
 
-napp-it CS (snap and replication jobs) uses this mode through the job setting **Freeze VM via freeze4snap** =
-`esxi_ssh` or `esxi_soap` plus the **VM server IP** (the ESXi host list). The tool runs on the napp-it CS
-**frontend** (a Windows/Linux machine that reaches the ESXi host, not necessarily the ZFS server); the ZFS snapshot is
-taken on the ZFS member by napp-it CS, between freeze and thaw. Login data for the ESXi hosts comes from the host table
-`_cfg/freeze4snap.cfg` on the frontend (`host,user,password`). A failed freeze never blocks the job (crash-consistent
-snapshot, reason in the job log); a missing VM server, tool or cfg is a hard error.
+napp-it CS (snap and replication jobs) has one job setting **Freeze VM prior snap** = `off | proxmox | esxi`.
+`proxmox` runs the tool on the ZFS member (Proxmox host); `esxi` runs it on the napp-it CS **frontend** (any
+machine that reaches the ESXi host) and takes the ZFS snapshot on the member between freeze and thaw. The
+ESXi hosts, logins, protocol (`--proto auto`) and the freeze chains all come from the cfg file
+`_cfg/freeze4snap/freeze4snap.cfg` on the frontend (`_cfg/freeze4snap/freeze4snap.readme` describes it). A failed
+freeze never blocks the job unless a chain is strict; a missing tool or cfg is a hard error.
 
 ### Freeze and thaw as separate steps
 

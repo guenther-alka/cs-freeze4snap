@@ -110,3 +110,32 @@ func TestFormatDetection(t *testing.T) {
 		t.Errorf("soap + cert must say so, got %v", err)
 	}
 }
+
+func TestHostTableSkipsPolicyLinesAndReadsOptions(t *testing.T) {
+	txt := "[quiesce,memory,zfs,30]\n192.168.2.48,root,secret\n192.168.2.48:vm100,memory,zfs\n192.168.2.48:proto=ssh\n192.168.2.48:hostkey=SHA256:abc  # pinned\n192.168.2.49,root,pw\n192.168.2.49:*,plain\n"
+	p := filepath.Join(t.TempDir(), "c.cfg")
+	if err := os.WriteFile(p, []byte(txt), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfigFor(p, "192.168.2.48")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Password != "secret" || c.Proto != "ssh" || c.HostKey != "SHA256:abc" {
+		t.Errorf("48: %+v", c)
+	}
+	c, err = LoadConfigFor(p, "192.168.2.49")
+	if err != nil || c.Proto != "" || c.Password != "pw" {
+		t.Errorf("49: %+v %v", c, err)
+	}
+	// a chain line first must not be taken for the start of a key=value file
+	if !isHostTable(txt) {
+		t.Error("table not recognised")
+	}
+	// key=value files may carry chains too
+	kv := filepath.Join(t.TempDir(), "k.cfg")
+	os.WriteFile(kv, []byte("host=1.2.3.4\npassword=x\nchain=memory,zfs\nvm7=quiesce\n"), 0o600)
+	if c, err = LoadConfig(kv); err != nil || c.Host != "1.2.3.4" {
+		t.Errorf("kv: %+v %v", c, err)
+	}
+}

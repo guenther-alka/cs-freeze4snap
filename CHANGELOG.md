@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.2.0 - freeze chains with timeouts, proto auto
+
+- New: **freeze chains** per guest, e.g. `[quiesce,memory,zfs,30]`: steps `quiesce`, `memory`, `plain`,
+  `pause`, `zfs` are tried from left to right, the first that works wins. `memory` (ESXi) takes a hot
+  snapshot including the RAM state when quiesce is not possible (no VMware Tools). Each step has its own
+  timeout (`memory:300`, or a bare number for the whole chain); a step that times out counts as failed and
+  the next one starts (ESXi: a snapshot the host may still create for it is removed again).
+- Chains are set in the cfg file - global `[...]`, per server `host:*,...`, per VM `host:vm100,...` - or with
+  `--policy` (repeatable). Precedence: `--mode`, `--policy`, VM, `*`, global, built-in default.
+  Steps that do not exist on a platform are skipped.
+- A chain **without** `zfs` is strict: if no step works the run aborts before the ZFS snapshot (per guest,
+  like `--forcefreeze`). A chain of only `zfs` takes no VM snapshot for that guest (`zfs-only`).
+- `guests[].chain` / `strict` in the JSON result.
+- `--proto auto` is the new default for ESXi: soap first, ssh if soap cannot be reached (warning); a failed soap
+  login is not retried over ssh (account lockout). The cfg host table takes per-host option lines
+  `host:proto=`, `host:port=`, `host:hostkey=`, `host:tls_sha256=`, `host:timeout=`, `host:useragent=`.
+- `--mode` now defaults to "" (the built-in chain) and acts as a shortcut chain for all VMs.
+- The key=value cfg form accepts `chain=` and `vm100=` lines.
+- Unchanged: Proxmox behaviour without `--policy`/cfg (default chain `quiesce,pause,zfs`) and the JSON of
+  v1.1.0 apart from the new fields.
+
 ## v1.1.0 - ESXi hotsnap (ssh or soap), remote use
 
 - New: hotsnap of all VMs on an NFS datastore of an ESXi host. `snap --hypervisor esxi`

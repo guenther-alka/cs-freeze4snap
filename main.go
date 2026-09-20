@@ -25,7 +25,7 @@ import (
 	"cs-freeze4snap/freezer"
 )
 
-const version = "1.1.0"
+const version = "1.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -69,7 +69,9 @@ Options for 'snap':
   --recursive               Pass -r to zfs snapshot (default: true)
   --exclude string          Comma-separated VMIDs to skip freezing
   --include-only string     Comma-separated VMIDs; overrides discovery entirely
-  --timeout duration        Max time to wait per guest freeze (default 30s)
+  --timeout duration        Max time to wait per guest freeze step (default 30s,
+                              ESXi 120s; overridden by timeouts in a chain)
+  --policy 'chain'          Freeze chain, repeatable, see below
 
 Freeze is always best-effort by default: if a guest can't be frozen for
 any reason (no guest agent, Proxmox/QMP not responding, unsupported
@@ -130,6 +132,12 @@ func runSnap(args []string) int {
 		return result.fail(err)
 	}
 
+	// freeze chains: --policy flags (the frontend passes the lines of the cfg
+	// file for this server), --mode as a shortcut
+	if err := eo.loadPolicy(""); err != nil {
+		return result.fail(err)
+	}
+
 	guests, err := freezer.DiscoverProxmoxGuests(*dataset)
 	if err != nil {
 		return result.fail(fmt.Errorf("discovery: %w", err))
@@ -161,17 +169,9 @@ func runSnap(args []string) int {
 	// only calls os.Exit() once runSnap (and its defers) have fully returned.
 	result.FreezeMs = time.Since(start).Milliseconds()
 
-	if *forceFreeze {
-		var unfrozen []int
-		for _, r := range sess.Results() {
-			if !r.Frozen {
-				unfrozen = append(unfrozen, r.VMID)
-			}
-		}
-		if len(unfrozen) > 0 {
-			result.Guests = sess.Results()
-			return result.fail(fmt.Errorf("--forcefreeze: %d guest(s) could not be cleanly frozen (vmids: %v) - aborting without snapshotting", len(unfrozen), unfrozen))
-		}
+	if unfrozen := abortList(sess.Results(), *forceFreeze); len(unfrozen) > 0 {
+		result.Guests = sess.Results()
+		return result.fail(abortError(unfrozen, *forceFreeze))
 	}
 
 	// Default path (and --forcefreeze once every guest froze cleanly):
@@ -196,6 +196,28 @@ func runSnap(args []string) int {
 	result.Status = "ok"
 	emit(result)
 	return 0
+}
+
+// abortList lists the guests that stop the run before the ZFS snapshot: any
+// unfrozen guest with --forcefreeze, else those whose chain has no zfs step.
+func abortList(rs []freezer.GuestResult, force bool) []int {
+	if !force {
+		return freezer.StrictViolations(rs)
+	}
+	var ids []int
+	for _, r := range rs {
+		if !r.Frozen && r.Strategy != freezer.StrategyZFSOnly {
+			ids = append(ids, r.VMID)
+		}
+	}
+	return ids
+}
+
+func abortError(ids []int, force bool) error {
+	if force {
+		return fmt.Errorf("--forcefreeze: %d guest(s) could not be frozen (vmids: %v) - aborting without snapshotting", len(ids), ids)
+	}
+	return fmt.Errorf("strict chain: %d guest(s) could not be frozen (vmids: %v) and their chain has no zfs fallback - aborting without snapshotting", len(ids), ids)
 }
 
 type runResult struct {

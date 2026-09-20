@@ -23,6 +23,7 @@ const (
 	StrategyQGA      = "qga"       // guest-agent fsfreeze - best case, only I/O paused
 	StrategyQMPPause = "qmp-pause" // QMP stop/cont - whole vCPU paused, no guest cooperation needed
 	StrategyNone     = "none"      // neither worked - snapshotting as-is (crash-consistent only)
+	StrategyZFSOnly  = "zfs-only"  // the chain names no freeze step (chain "zfs"): ZFS snapshot only
 )
 
 // QEMUFreezer freezes/thaws QEMU/KVM VMs, trying progressively weaker but
@@ -113,23 +114,41 @@ func (q *QEMUFreezer) qmpSocketPath(vmid int) string {
 	return fmt.Sprintf("%s/%d.qmp", dir, vmid)
 }
 
-// Freeze implements the three-stage cascade described on QEMUFreezer.
+// ChainOf is the chain that applies to g: policy first, then quiesce,pause.
+func (q *QEMUFreezer) ChainOf(g Guest) Chain { return ChainFor(g, DefaultProxmoxChain) }
+
+// Freeze walks the guest's chain (see policy.go): quiesce = QGA fsfreeze, pause
+// = QMP stop, each with its own timeout; the first that works wins.
 func (q *QEMUFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
-	if err := q.freezeViaQGA(g.VMID, timeout); err == nil {
-		q.setStrategy(g.VMID, StrategyQGA)
-		return StrategyQGA, nil
+	ch := q.ChainOf(g)
+	steps, unsupported := ch.StepsFor(PlatformProxmoxQEMU)
+	if len(steps) == 0 {
+		if ch.ZFS && len(unsupported) == 0 {
+			return StrategyZFSOnly, nil
+		}
+		return "", fmt.Errorf("chain %q has no step that works on a Proxmox VM (quiesce, pause)", ch)
+	}
+	for _, st := range steps {
+		to := ch.StepTimeout(st, timeout)
+		switch st.Kind {
+		case StepQuiesce:
+			if err := q.freezeViaQGA(g.VMID, to); err == nil {
+				q.setStrategy(g.VMID, StrategyQGA)
+				return StrategyQGA, nil
+			}
+		case StepPause:
+			if err := q.pauseViaQMP(g.VMID, to); err == nil {
+				q.setStrategy(g.VMID, StrategyQMPPause)
+				return StrategyQMPPause, nil
+			}
+		}
 	}
 
-	if err := q.pauseViaQMP(g.VMID, timeout); err == nil {
-		q.setStrategy(g.VMID, StrategyQMPPause)
-		return StrategyQMPPause, nil
-	}
-
-	// Neither worked. This is deliberately NOT an error - see the Freezer
+	// No step worked. This is deliberately NOT an error - see the Freezer
 	// interface doc on the "none" strategy. The most common real-world
 	// cause is simply "no qemu-guest-agent configured", which is a normal,
-	// expected state for many VMs, not a failure condition worth aborting
-	// the whole snapshot job over.
+	// expected state for many VMs. Whether the run goes on is up to the chain
+	// (strict chains abort in the caller, see StrictViolations).
 	q.setStrategy(g.VMID, StrategyNone)
 	return StrategyNone, nil
 }

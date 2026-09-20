@@ -84,44 +84,101 @@ func (f *ESXiFreezer) vmSnapName(g Guest) string {
 	return fmt.Sprintf("%s-%d", n, g.VMID)
 }
 
-// Freeze takes the VM snapshot, trying progressively weaker variants:
-// quiesce (or memory) first, then a plain disk snapshot.
+// defaultChain is the chain used for guests no policy line names: what --mode /
+// NewESXiFreezer(mode) stands for.
+func (f *ESXiFreezer) defaultChain() Chain {
+	c, _ := ChainOfMode(f.mode)
+	return c
+}
+
+// ChainOf is the chain that applies to g: policy first, then the mode's default.
+func (f *ESXiFreezer) ChainOf(g Guest) Chain { return ChainFor(g, f.defaultChain()) }
+
+// esxiStep maps a chain step to the flags of the VM snapshot and its strategy.
+func esxiStep(kind string) (mem, quiesce bool, strategy, what string) {
+	switch kind {
+	case StepQuiesce:
+		return false, true, StrategyESXiQuiesce, "quiesced"
+	case StepMemory:
+		return true, false, StrategyESXiMem, "memory"
+	}
+	return false, false, StrategyESXiSnap, "plain"
+}
+
+// Freeze takes the VM snapshot: it walks the guest's chain (quiesce, memory,
+// plain - see policy.go) and the first step that works wins. Every step gets
+// its own timeout (the step's, else the chain's, else timeout). A step that
+// fails or times out is cleaned up before the next one starts. Without a
+// usable step the guest is reported as not frozen; whether that aborts the run
+// depends on the chain (see Chain.Strict).
 func (f *ESXiFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
-	type try struct {
-		mem, quiesce bool
-		strategy     string
+	ch := f.ChainOf(g)
+	steps, unsupported := ch.StepsFor(PlatformESXi)
+	if len(steps) == 0 {
+		if ch.ZFS && len(unsupported) == 0 {
+			return StrategyZFSOnly, nil // chain "zfs": no VM snapshot wanted
+		}
+		return "", fmt.Errorf("chain %q has no step that works on ESXi (quiesce, memory, plain)", ch)
 	}
-	var tries []try
-	switch f.mode {
-	case ModeMem:
-		tries = []try{{true, false, StrategyESXiMem}, {false, false, StrategyESXiSnap}}
-	case ModePlain:
-		tries = []try{{false, false, StrategyESXiSnap}}
-	default:
-		tries = []try{{false, true, StrategyESXiQuiesce}, {false, false, StrategyESXiSnap}}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 	name := f.vmSnapName(g)
-	var errs []string
-	for i, t := range tries {
-		id, err := f.tr.CreateSnapshot(ctx, g.VMID, name, ESXiTag, t.mem, t.quiesce)
+	var fails []string
+	for i, st := range steps {
+		to := ch.StepTimeout(st, timeout)
+		mem, quiesce, strategy, what := esxiStep(st.Kind)
+		ctx, cancel := context.WithTimeout(context.Background(), to)
+		id, err := f.tr.CreateSnapshot(ctx, g.VMID, name, ESXiTag, mem, quiesce)
+		expired := ctx.Err() != nil
+		cancel()
 		if err == nil {
-			s := &esxiSnap{ID: id, Name: name, Strategy: t.strategy}
+			s := &esxiSnap{ID: id, Name: name, Strategy: strategy}
 			if i > 0 {
-				s.Note = fmt.Sprintf("%s failed (%s) - took a plain snapshot instead: crash-consistent only", tries[0].strategy, strings.Join(errs, "; "))
+				s.Note = fmt.Sprintf("%s - took a %s snapshot instead", strings.Join(fails, "; "), what)
+				switch st.Kind {
+				case StepPlain:
+					s.Note += ": crash-consistent only"
+				case StepMemory:
+					s.Note += ": RAM state kept, filesystem not quiesced"
+				}
 			}
 			f.mu.Lock()
 			f.snaps[g.VMID] = s
 			f.mu.Unlock()
-			return t.strategy, nil
+			return strategy, nil
 		}
-		errs = append(errs, err.Error())
-		if ctx.Err() != nil {
-			break
+		msg := err.Error()
+		if expired {
+			msg = fmt.Sprintf("timed out after %ds", int(to/time.Second))
+		}
+		if left := f.reap(g, name); left != "" {
+			msg += " (" + left + ")"
+		}
+		fails = append(fails, st.Kind+": "+msg)
+	}
+	return "", fmt.Errorf("vm snapshot failed: %s", strings.Join(fails, "; "))
+}
+
+// reap removes a snapshot a failed or timed-out step may have left behind (the
+// host can finish a task after the client gave up). It returns a short note
+// when something could not be removed.
+func (f *ESXiFreezer) reap(g Guest, name string) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	snaps, err := f.tr.Snapshots(ctx, g.VMID)
+	if err != nil {
+		return ""
+	}
+	var bad []string
+	for _, sn := range snaps {
+		if sn.Name == name && sn.Desc == ESXiTag {
+			if err := f.tr.RemoveSnapshot(ctx, g.VMID, sn.ID); err != nil {
+				bad = append(bad, sn.ID)
+			}
 		}
 	}
-	return "", fmt.Errorf("vm snapshot failed: %s", strings.Join(errs, "; "))
+	if len(bad) > 0 {
+		return "leftover snapshot " + strings.Join(bad, ",") + " - run cleanup"
+	}
+	return ""
 }
 
 // Thaw removes the VM snapshot Freeze took. A guest without one is a no-op.

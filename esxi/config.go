@@ -45,7 +45,7 @@ func LoadConfig(path string) (Config, error) {
 	for sc.Scan() {
 		line++
 		t := strings.TrimSpace(strings.TrimPrefix(sc.Text(), string([]byte{0xEF, 0xBB, 0xBF})))
-		if t == "" || strings.HasPrefix(t, "#") {
+		if t == "" || strings.HasPrefix(t, "#") || isPolicyLine(t) {
 			continue
 		}
 		i := strings.Index(t, "=")
@@ -107,7 +107,7 @@ func (c *Config) ApplyEnv() {
 
 // Normalize fills defaults and validates the result.
 func (c *Config) Normalize() error {
-	if c.Proto == "" {
+	if c.Proto == "" || c.Proto == "auto" {
 		c.Proto = "ssh"
 	}
 	if c.Proto != "ssh" && c.Proto != "soap" {
@@ -138,8 +138,26 @@ func (c *Config) Normalize() error {
 	return nil
 }
 
-// Open connects with the transport selected by c.Proto.
+// checkAuto validates what proto auto needs before trying anything.
+func checkAuto(c Config) error {
+	if c.Host == "" {
+		return fmt.Errorf("no ESXi host: set host= in the cfg file or CS_ESXI_HOST")
+	}
+	if c.Password == "" && c.Key == "" {
+		return fmt.Errorf("no credentials: set password= (or key= for ssh) in the cfg file, or CS_ESXI_PASSWORD")
+	}
+	return nil
+}
+
+// Open connects with the transport selected by c.Proto (ssh, soap; "" or auto:
+// soap first, ssh as fallback).
 func Open(c Config) (Transport, error) {
+	if c.Proto == "" || c.Proto == "auto" {
+		if err := checkAuto(c); err != nil {
+			return nil, err
+		}
+		return openAuto(c)
+	}
 	if err := c.Normalize(); err != nil {
 		return nil, err
 	}

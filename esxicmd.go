@@ -24,17 +24,27 @@ import (
 )
 
 const esxiUsage = `  --hypervisor esxi        (snap only) hotsnap ESXi VMs instead of Proxmox guests
-  --cfg file               ESXi connection file (key=value): host, user, password, proto,
-                             port, key, key_passphrase, hostkey, tls_sha256, useragent, timeout.
+  --cfg file               ESXi connection file: a host table (host,user,password / host,cert) or
+                             key=value (host, user, password, proto, port, key, key_passphrase,
+                             hostkey, tls_sha256, useragent, timeout); it may also hold the freeze
+                             chains, see freeze4snap.readme.
                              CS_ESXI_HOST / CS_ESXI_USER / CS_ESXI_PASSWORD override the file,
                              --host / --user / --proto override both. The password is never a flag.
-  --proto ssh|soap         transport (default ssh: vim-cmd; soap: vSphere API on port 443)
+  --proto auto|ssh|soap    transport (default auto: soap = vSphere API on port 443, ssh = vim-cmd
+                             if soap cannot be reached; a failed soap login is not retried)
   --host, --user           ESXi host / login (default user root)
   --storage nfs            select the VMs by storage: all VMs on the NFS export of the dataset
   --nfs-path path          NFS export path as ESXi mounts it (default: mountpoint of --dataset)
   --nfs-server host        NFS server as ESXi knows it, needed if the path is exported twice
   --vms all|id,name,...    which VMs on that NFS (default all; --snap is an alias)
-  --mode quiesce|mem|plain what the VM snapshot contains (default quiesce, falls back to plain)
+  --mode quiesce|mem|plain shortcut for a chain that applies to every VM: quiesce = quiesce,plain,zfs;
+                             mem = memory,plain,zfs; plain = plain,zfs (default: the chains of the cfg
+                             file, else quiesce,plain,zfs)
+  --policy 'chain'         freeze chain, repeatable: '[quiesce,memory,zfs,30]' for every guest,
+                             'vm100,memory,zfs' for one VM ('*' for all). Steps: quiesce, memory,
+                             plain, pause (Proxmox VM), zfs; a number is a timeout in seconds,
+                             'step:60' one step's. Without zfs at the end the chain is strict: a guest
+                             that cannot be frozen aborts the run before the ZFS snapshot.
   --allow-mixed            also snapshot VMs that have disks on other datastores
   --include-off            also snapshot powered-off/suspended VMs (default: they are skipped,
                              they are consistent anyway)
@@ -65,6 +75,7 @@ type esxiOpts struct {
 	nfsServer   string
 	vms         string
 	mode        string
+	policy      multiFlag
 	allowMixed  bool
 	includeOff  bool
 	thawTimeout time.Duration
@@ -77,7 +88,7 @@ func (o *esxiOpts) register(fs *flag.FlagSet, withHypervisor bool) {
 		fs.StringVar(&o.hypervisor, "hypervisor", "proxmox", "proxmox or esxi")
 	}
 	fs.StringVar(&o.cfg, "cfg", "", "ESXi connection file (key=value)")
-	fs.StringVar(&o.proto, "proto", "", "esxi transport: ssh or soap")
+	fs.StringVar(&o.proto, "proto", "", "esxi transport: auto (default), ssh or soap")
 	fs.StringVar(&o.host, "host", "", "esxi host")
 	fs.StringVar(&o.user, "user", "", "esxi user")
 	fs.StringVar(&o.storage, "storage", "nfs", "select VMs by storage type (only nfs)")
@@ -85,7 +96,8 @@ func (o *esxiOpts) register(fs *flag.FlagSet, withHypervisor bool) {
 	fs.StringVar(&o.nfsServer, "nfs-server", "", "NFS server as ESXi knows it")
 	fs.StringVar(&o.vms, "vms", "all", "all or comma list of VM ids/names")
 	fs.StringVar(&o.vms, "snap", "all", "alias of --vms")
-	fs.StringVar(&o.mode, "mode", freezer.ModeQuiesce, "quiesce, mem or plain")
+	fs.StringVar(&o.mode, "mode", "", "quiesce, mem or plain (a chain for every VM)")
+	fs.Var(&o.policy, "policy", "freeze chain, repeatable: '[quiesce,memory,zfs,30]' or 'vm100,memory,zfs'")
 	fs.BoolVar(&o.allowMixed, "allow-mixed", false, "also snapshot VMs with disks on other datastores")
 	fs.BoolVar(&o.includeOff, "include-off", false, "also snapshot powered-off/suspended VMs")
 	fs.DurationVar(&o.thawTimeout, "thaw-timeout", 2*time.Minute, "max time to remove one VM snapshot")
@@ -93,8 +105,40 @@ func (o *esxiOpts) register(fs *flag.FlagSet, withHypervisor bool) {
 	fs.StringVar(&o.state, "state", "", "state file for freeze/thaw")
 }
 
-// connect opens the transport: cfg file, then environment, then flags.
-func (o *esxiOpts) connect() (esxi.Transport, error) {
+// multiFlag is a repeatable string flag.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, " | ") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+// loadPolicy installs the freeze chains: the cfg file (lines of this server),
+// then the --policy flags, then --mode; the strongest wins.
+func (o *esxiOpts) loadPolicy(host string) error {
+	p, err := freezer.LoadPolicy(o.cfg, host)
+	if err != nil {
+		return err
+	}
+	if len(o.policy) > 0 {
+		fp, err := freezer.PolicyOfFlags(o.policy)
+		if err != nil {
+			return err
+		}
+		p = p.Merge(fp)
+	}
+	if o.mode != "" {
+		c, ok := freezer.ChainOfMode(o.mode)
+		if !ok {
+			return fmt.Errorf("--mode must be quiesce, mem or plain, not %q", o.mode)
+		}
+		p.SetOverride(c)
+	}
+	freezer.SetPolicy(p)
+	return nil
+}
+
+// connect opens the transport: cfg file, then environment, then flags. With
+// policy the freeze chains are loaded for the server that was resolved.
+func (o *esxiOpts) connect(policy bool) (esxi.Transport, error) {
 	if o.storage != "nfs" {
 		return nil, fmt.Errorf("--storage must be nfs, not %q", o.storage)
 	}
@@ -116,6 +160,11 @@ func (o *esxiOpts) connect() (esxi.Transport, error) {
 	}
 	if o.proto != "" {
 		c.Proto = strings.ToLower(o.proto)
+	}
+	if policy {
+		if err := o.loadPolicy(c.Host); err != nil {
+			return nil, err
+		}
 	}
 	return esxi.Open(c)
 }
@@ -233,7 +282,7 @@ func runSnapESXi(o *esxiOpts, result runResult, recursive bool, timeout time.Dur
 		ferr error
 	)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	tr, ferr = o.connect()
+	tr, ferr = o.connect(true)
 	if ferr == nil {
 		result.Transport = tr.Name()
 		defer tr.Close()
@@ -258,7 +307,7 @@ func runSnapESXi(o *esxiOpts, result runResult, recursive bool, timeout time.Dur
 	if len(guests) == 0 {
 		result.Note = "no powered-on VMs on this NFS - snapshotting without VM snapshots"
 	}
-	f, err := freezer.NewESXiFreezer(tr, o.mode, name)
+	f, err := freezer.NewESXiFreezer(tr, "", name)
 	if err != nil {
 		return result.fail(err)
 	}
@@ -270,19 +319,11 @@ func runSnapESXi(o *esxiOpts, result runResult, recursive bool, timeout time.Dur
 	defer fzr.Thaw() // safety net: Thaw is idempotent
 	result.FreezeMs = time.Since(start).Milliseconds()
 
-	if forceFreeze {
-		var unfrozen []int
-		for _, r := range fzr.Results() {
-			if !r.Frozen {
-				unfrozen = append(unfrozen, r.VMID)
-			}
-		}
-		if len(unfrozen) > 0 {
-			fzr.Thaw()
-			result.Guests = fzr.Results()
-			result.Warnings = collectWarnings(tr, disc)
-			return result.fail(fmt.Errorf("--forcefreeze: %d VM(s) could not be snapshotted (vmids: %v) - aborting without snapshotting", len(unfrozen), unfrozen))
-		}
+	if unfrozen := abortList(fzr.Results(), forceFreeze); len(unfrozen) > 0 {
+		fzr.Thaw()
+		result.Guests = fzr.Results()
+		result.Warnings = collectWarnings(tr, disc)
+		return result.fail(abortError(unfrozen, forceFreeze))
 	}
 
 	snapErr := takeZFS(o, dataset, name, recursive)
@@ -335,7 +376,7 @@ func runDiscoverESXi(args []string) int {
 	fs, o, dataset, _, recursive, _ := esxiCmdFlags("discover")
 	fs.Parse(args)
 	res := runResult{Dataset: *dataset, Hypervisor: "esxi"}
-	tr, err := o.connect()
+	tr, err := o.connect(false)
 	if err != nil {
 		return res.fail(err)
 	}
@@ -367,7 +408,7 @@ func runFreezeESXi(args []string) int {
 	if *name == "" || o.state == "" {
 		return res.fail(errors.New("freeze needs --name (the ZFS snapshot name) and --state (file for the VM snapshot handles)"))
 	}
-	tr, err := o.connect()
+	tr, err := o.connect(true)
 	if err != nil {
 		return res.fail(err)
 	}
@@ -382,7 +423,7 @@ func runFreezeESXi(args []string) int {
 	}
 	res.NFSPath, res.Datastores, res.Skipped = path, dsNames(d.Datastores), d.Skipped
 
-	f, err := freezer.NewESXiFreezer(tr, o.mode, *name)
+	f, err := freezer.NewESXiFreezer(tr, "", *name)
 	if err != nil {
 		return res.fail(err)
 	}
@@ -393,6 +434,11 @@ func runFreezeESXi(args []string) int {
 	res.FreezeMs = time.Since(start).Milliseconds()
 	res.Guests = sess.Results()
 	res.Warnings = collectWarnings(tr, d)
+	if bad := abortList(sess.Results(), false); len(bad) > 0 {
+		sess.Thaw()
+		res.Guests = sess.Results()
+		return res.fail(abortError(bad, false))
+	}
 
 	// The state file is what makes the snapshots removable later; if it cannot
 	// be written, take them off again right away rather than leaking them.
@@ -427,14 +473,14 @@ func runThawESXi(args []string) int {
 		return res.fail(err)
 	}
 	res.Dataset, res.Snapshot = st.Dataset, st.Snapshot
-	tr, err := o.connect()
+	tr, err := o.connect(false)
 	if err != nil {
 		return res.fail(err)
 	}
 	defer tr.Close()
 	res.Transport = tr.Name()
 
-	f, err := freezer.NewESXiFreezer(tr, o.mode, st.Snapshot)
+	f, err := freezer.NewESXiFreezer(tr, "", st.Snapshot)
 	if err != nil {
 		return res.fail(err)
 	}
@@ -472,7 +518,7 @@ func runCleanupESXi(args []string) int {
 	fs, o, dataset, _, recursive, _ := esxiCmdFlags("cleanup")
 	fs.Parse(args)
 	res := runResult{Dataset: *dataset, Hypervisor: "esxi"}
-	tr, err := o.connect()
+	tr, err := o.connect(false)
 	if err != nil {
 		return res.fail(err)
 	}

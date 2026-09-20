@@ -92,7 +92,17 @@ func (l *LXCFreezer) cgroupFreezePath(vmid int) string {
 	return fmt.Sprintf("%s/lxc/%d/cgroup.freeze", root, vmid)
 }
 
+// ChainOf is the chain that applies to g: policy first, then quiesce.
+func (l *LXCFreezer) ChainOf(g Guest) Chain { return ChainFor(g, DefaultLXCChain) }
+
 func (l *LXCFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
+	ch := l.ChainOf(g)
+	if steps, unsupported := ch.StepsFor(PlatformProxmoxLXC); len(steps) == 0 {
+		if ch.ZFS && len(unsupported) == 0 {
+			return StrategyZFSOnly, nil
+		}
+		return "", fmt.Errorf("chain %q has no step that works on a container (quiesce)", ch)
+	}
 	mp, err := l.mountpoint(g)
 	if err != nil {
 		return "", err
