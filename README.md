@@ -4,8 +4,7 @@ Consistent ZFS snapshots for Proxmox VM/LXC guests and ESXi VMs - freeze if poss
 snapshot regardless.
 
 Part of the [napp-it 4ai (client-server edition)](https://napp-it.org) cluster tooling family
-(alongside [cs-sync](https://github.com/guenther-alka/cs-sync) and
-[cs-stream](https://github.com/guenther-alka/cs-stream)).
+(alongside [cs-tools](https://www.napp-it.org/cs-tools_en.html))
 csweb-gui deploys and updates this manually per member menu About > Download cs-tools
 
 ## Goal
