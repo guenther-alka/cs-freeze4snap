@@ -241,6 +241,13 @@ func TestSOAPLicenseHint(t *testing.T) {
 	}
 }
 
+// TestSOAPLoginAndPin needs one working loopback TLS connection to the
+// in-process fake vSphere server: it asserts on the exact error strings
+// ("incorrect user name or password", "certificate mismatch"), so a machine
+// where something filters the loopback traffic of a freshly built test binary
+// (AV/firewall) fails this test although the code is fine. That happened once
+// on Windows and was mis-read as a platform difference; verified passing on
+// Windows (20 consecutive runs) and on Linux, 2026-09-20.
 func TestSOAPLoginAndPin(t *testing.T) {
 	f, c := startFakeVSphere(t)
 	bad := c

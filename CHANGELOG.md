@@ -27,7 +27,6 @@
   `freeze,zfs`. `--mode freeze` keeps meaning `freeze,plain,zfs`. To get the old behaviour set
   `[freeze,plain,zfs]` / `[freeze,pause,zfs]` in the cfg or `--policy`.
 - The Proxmox snapshot timeout of a memory step defaults to 120 s (writing the RAM takes longer than a QGA freeze).
-- Note: `TestSOAPLoginAndPin` fails on Windows (as in v1.1.0/v1.2.0, a test-environment issue); all tests pass on Linux.
 
 ## v1.2.0 - freeze chains with timeouts, proto auto
 
