@@ -35,11 +35,13 @@ const (
 	PlatformProxmoxLXC  Platform = "proxmox-lxc"
 	PlatformHyperV      Platform = "hyperv" // not yet implemented
 	PlatformBhyve       Platform = "bhyve"  // not yet implemented
+	PlatformESXi        Platform = "esxi"   // VMware ESXi, remote via ssh or soap (esxi.go)
 )
 
 // Guest describes one discovered guest that may need to be frozen.
 type Guest struct {
 	VMID     int
+	Name     string // VM name where the platform has one (ESXi), for logging
 	Type     GuestType
 	Platform Platform
 	Dataset  string // ZFS dataset/zvol backing this guest (for logging)

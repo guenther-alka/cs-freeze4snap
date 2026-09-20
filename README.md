@@ -1,6 +1,6 @@
 # cs-freeze4snap
 
-Consistent ZFS snapshots for Proxmox VM/LXC guests - freeze if possible,
+Consistent ZFS snapshots for Proxmox VM/LXC guests and ESXi VMs - freeze if possible,
 snapshot regardless.
 
 Part of the [napp-it 4ai (client-server edition)](https://napp-it.org) cluster tooling family
@@ -319,6 +319,167 @@ Verified end-to-end (see Test results below): a recursive snap job with
 snapshot was confirmed (via `.zfs/snapshot/.../`) to contain those
 config files alongside the frozen guest disk data.
 
+## ESXi: hotsnap of all VMs on an NFS datastore (v1.1.0)
+
+`cs-freeze4snap` can also take the ZFS snapshot of an **NFS export used as an
+ESXi datastore** in a VM-consistent way. It finds the VMs on that NFS itself,
+takes a VM snapshot of each powered-on VM on the ESXi host (the "freeze"), takes
+the ZFS snapshot, and removes the VM snapshots again (the "thaw"). The ZFS
+snapshot then holds every VM with an embedded ESXi snapshot: after a restore
+(`zfs clone`/`rollback`) revert the VM to that snapshot to get a
+filesystem-consistent (`quiesce`) or running-state (`mem`) image instead of a
+crash image.
+
+```
+cs-freeze4snap snap --hypervisor esxi --cfg /path/esxi.cfg \
+    --dataset tank/nfs --name auto_20260919_2100 --storage nfs --vms all
+```
+
+Because the ESXi host is reached over the network (ssh or soap), the tool does
+**not** have to run on the ZFS server - any machine that can reach the ESXi host
+works (a frontend, a jump host). The ZFS snapshot is taken by the local `zfs`, or
+on a remote machine by `--zfs-cmd`:
+
+```
+cs-freeze4snap snap --hypervisor esxi --cfg esxi.cfg --dataset tank/nfs --name s1 \
+    --zfs-cmd 'ssh root@nas zfs snapshot -r {fullname}'
+```
+
+`{dataset}`, `{snapshot}` and `{fullname}` (`dataset@snapshot`) are replaced; the
+names are checked against `[A-Za-z0-9_.:/-]` first. The command runs via `sh -c`
+(`cmd /C` on Windows).
+
+### How the VMs are found
+
+1. The NFS export path comes from `--nfs-path`, or from the `mountpoint` of
+   `--dataset` (`zfs get mountpoint`; without a local zfs it assumes `/<dataset>`
+   and warns).
+2. The host's NFS datastores whose export matches (plus exports of child
+   datasets with `--recursive`, the default) are selected. If the same path is
+   exported by more than one NFS server, name it with `--nfs-server`.
+3. Every VM with files on those datastores is a candidate. Selected for a VM
+   snapshot are the powered-on VMs (`--vms all`, or a comma list of ids and names).
+   Skipped, and listed with the reason in `skipped`:
+   - powered off / suspended VMs - they are consistent anyway (`--include-off` snapshots them too),
+   - VMs that also have disks on another datastore - a ZFS snapshot of this NFS would hold only part
+     of them (`--allow-mixed` to snapshot them anyway, with a warning),
+   - VMs not in the `--vms` list.
+
+`discover` shows exactly that without changing anything:
+
+```
+cs-freeze4snap discover --cfg esxi.cfg --nfs-path /tank/nfs
+```
+
+### Connection: `--cfg`
+
+**Host table** (one file for all servers, one server per line, `#` comments):
+
+```
+# host,user,password
+192.168.2.48,root,secret
+192.168.2.49,root,pass,with,commas    # the password is everything after the 2nd comma
+192.168.2.50,cert                     # ssh key of the running user (~/.ssh/id_ed25519, id_ecdsa, id_rsa), user root
+192.168.2.51,ops,cert                 # same key, other user
+192.168.2.52,root,cert,/etc/keys/esx  # explicit OpenSSH private key
+```
+
+`--host <ip>` selects the line (with only one line in the file it can be left out).
+`cert` entries work with `--proto ssh` only (OpenSSH keys, no PuTTY `.ppk`); soap needs a password.
+The same file can serve several tools and jobs - `--proto` (ssh or soap) is chosen per call.
+
+**Single-server key=value file** - use it when a server needs more than login data:
+
+```
+host=192.168.2.48
+user=root
+password=...              # or CS_ESXI_PASSWORD in the environment - never a command line flag
+proto=ssh                 # ssh (vim-cmd) or soap (vSphere API, port 443)
+hostkey=SHA256:...        # ssh: pin the host key (the first run prints it in "warnings")
+tls_sha256=...            # soap: pin the certificate (sha256 hex)
+key=/path/id_ed25519      # ssh: OpenSSH private key instead of a password (no PuTTY .ppk)
+timeout=15                # connect timeout in seconds
+```
+
+The format is detected from the first entry line (`host,...` is a table, `key=...` a key=value file).
+`CS_ESXI_HOST`, `CS_ESXI_USER` and `CS_ESXI_PASSWORD` override the file;
+`--host`, `--user`, `--proto` override both. Keep the file readable by the
+job user only (`chmod 600`). Without `hostkey`/`tls_sha256` (only possible in the key=value form) the
+connection works but the JSON `warnings` tell you what to pin.
+
+| | ssh | soap |
+|---|---|---|
+| free ESXi license | works (`vim-cmd`) | works: the free license only accepts the write calls from a client whose User-Agent starts with "VMware" - the tool sends `VMware VI Client/4.0.0` (`useragent=` overrides it) |
+| speed (16 VMs, measured) | ~12 s to list VMs, ~3 s per snapshot | ~0.2 s to list VMs, ~2 s per snapshot |
+| needs | ssh service on the host | port 443 |
+
+Use soap where possible; ssh is the fallback that always works. The ESXi
+clock is not used (the tool names snapshots itself), so a wrong host clock does no harm.
+
+### Modes: `--mode`
+
+| mode | VM snapshot | when it fails |
+|---|---|---|
+| `quiesce` (default) | disks, guest filesystem quiesced by VMware Tools | falls back to `plain` (a warning says so) |
+| `mem` | disks and RAM (hot snapshot, takes longer) | falls back to `plain` |
+| `plain` | disks only, crash-consistent | the VM is reported not frozen |
+
+As with Proxmox, a VM that cannot be snapshotted never blocks the ZFS snapshot -
+it is reported in `warnings` (and in `guests[].warning`). `--forcefreeze` aborts
+before the ZFS snapshot instead. Unlike a plain Proxmox run, an unreachable ESXi
+host or a wrong password is treated the same way: the ZFS snapshot is taken
+without VM snapshots and the reason is in `warnings` (with `--forcefreeze` the run
+aborts). The default `--timeout` for ESXi is 120 s per VM (quiesced snapshots take
+their time).
+
+The VM snapshots are named `cs4s-<snapshot>-<vmid>` and carry the description
+`cs-freeze4snap`; only such snapshots are ever removed by the tool.
+
+### Use from napp-it CS jobs
+
+napp-it CS (snap and replication jobs) uses this mode through the job setting **Freeze VM via freeze4snap** =
+`esxi_ssh` or `esxi_soap` plus the **VM server IP** (the ESXi host list). The tool runs on the napp-it CS
+**frontend** (a Windows/Linux machine that reaches the ESXi host, not necessarily the ZFS server); the ZFS snapshot is
+taken on the ZFS member by napp-it CS, between freeze and thaw. Login data for the ESXi hosts comes from the host table
+`_cfg/freeze4snap.cfg` on the frontend (`host,user,password`). A failed freeze never blocks the job (crash-consistent
+snapshot, reason in the job log); a missing VM server, tool or cfg is a hard error.
+
+### Freeze and thaw as separate steps
+
+For jobs where the snapshot is taken by something else (a replication step, a script on
+the ZFS server):
+
+```
+cs-freeze4snap freeze --cfg esxi.cfg --dataset tank/nfs --name s1 --state /var/tmp/s1.json
+zfs snapshot -r tank/nfs@s1                                    # by any means
+cs-freeze4snap thaw   --cfg esxi.cfg --state /var/tmp/s1.json
+```
+
+`freeze` writes the VM snapshot handles to the state file (mode 0600) and leaves the
+snapshots in place; `thaw` removes them and deletes the state file (it keeps the file and exits
+non-zero if a snapshot could not be removed; a snapshot that is already gone counts as removed).
+**Do not leave VM snapshots standing** - they grow. After a crash run
+`cleanup` - it removes every VM snapshot with the tool's tag on the NFS's VMs:
+
+```
+cs-freeze4snap cleanup --cfg esxi.cfg --nfs-path /tank/nfs
+```
+
+### Extra JSON fields (ESXi)
+
+`hypervisor` (`"esxi"`), `transport`, `nfs_path`, `datastores` (the matched ESXi datastore
+names), `skipped` (`vmid`, `name`, `reason`), `state` (`freeze`), `removed` (`cleanup`);
+each `guests[]` entry has `platform: "esxi"`, `name`, `strategy` (`esxi-quiesce`,
+`esxi-mem`, `esxi-snap`) and `snap_id`. `CS_ESXI_DEBUG=1` prints every ssh command / soap call
+with its duration to stderr.
+
+### Restoring
+
+Restore the VM files from the ZFS snapshot (e.g. clone the snapshot and register/copy the VM
+folder, or `zfs rollback`), then on the ESXi host revert the VM to the embedded
+snapshot (`vim-cmd vmsvc/snapshot.revert <vmid> <snapid> 0`, or in the UI: Snapshots ->
+`cs4s-<snapshot>-<vmid>` -> Restore).
+
 ## Result format
 
 ```jsonc
@@ -396,7 +557,10 @@ separate project on its own.
 
 ## Requirements
 
-- Runs **on the Proxmox host** (not inside a guest) - it shells out to
+- ESXi mode (v1.1.0): runs on **any machine** that reaches the ESXi host over ssh (port 22) or soap
+  (port 443); the ZFS snapshot is taken locally or with `--zfs-cmd`. 8 static builds (`build-all.ps1`, `CGO_ENABLED=0`):
+  linux (amd64, arm64), darwin (amd64, arm64), windows, freebsd, illumos and solaris (amd64).
+- Proxmox mode: runs **on the Proxmox host** (not inside a guest) - it shells out to
   `zfs`, `qm`/`pct` conventions apply, and talks to the QGA/QMP sockets
   that only exist on the host.
 - Go 1.21+ to build.
@@ -408,6 +572,21 @@ separate project on its own.
   directly in `freezer/lxc.go`).
 
 ## Test results
+
+**ESXi (v1.1.0):** unit tests use an in-process fake ssh server (keyboard-interactive login, canned `vim-cmd`/`esxcli`
+output taken from a real host) and a fake vSphere SOAP endpoint that, like the free license, refuses write calls
+unless the User-Agent starts with "VMware". End-to-end against a real ESXi 8 (free license, NFS datastores of a ZFS
+server): `discover`, `freeze`/`thaw`, `snap`, `cleanup` over ssh and soap, the quiesce/mem/plain modes on a powered-off
+test VM, thaw after cleanup, wrong password and unreachable host (best-effort and `--forcefreeze`).
+Also end-to-end from napp-it CS replication jobs (frontend on Windows, ZFS server on OmniOS, real ESXi 8; job setting
+`freeze=esxi_soap` and `esxi_ssh`, host table with password): with two running VMs that have VMware Tools the run took
+9-12 s for freeze, ZFS snapshot and thaw, the VM snapshots were removed again, and the incremental replication of the
+NFS dataset finished ok. One VM (tn_scale) got a quiesced snapshot; on the other one (w2019) the quiesce failed inside
+the guest and the tool fell back to a plain snapshot as documented (`strategy: "esxi-snap"`, warning in the result).
+A running VM with a disk on another datastore was skipped as documented. Not tested: NFS 4.1 datastores,
+ESXi 6.x/7.x, restoring a hotsnap ZFS snapshot (clone/rollback and revert of the VM snapshot).
+
+**Proxmox:**
 
 Beyond the unit test suite (`go test ./...`, including `-race`), this tool
 was validated end-to-end against a real Proxmox 9 host (`pve`,

@@ -15,6 +15,7 @@ import (
 // other freeze-side failure.
 type GuestResult struct {
 	VMID     int       `json:"vmid"`
+	Name     string    `json:"name,omitempty"` // VM name (ESXi)
 	Type     GuestType `json:"type"`
 	Platform Platform  `json:"platform"`
 	Frozen   bool      `json:"frozen"`
@@ -26,6 +27,15 @@ type GuestResult struct {
 	// error from the Freezer implementation. Purely informational - never
 	// causes the snapshot to be skipped or the job to abort.
 	Warning string `json:"warning,omitempty"`
+	// SnapID is the VM snapshot that stands in for the freeze (ESXi): the
+	// handle "thaw" needs to remove it again.
+	SnapID string `json:"snap_id,omitempty"`
+}
+
+// noter is optionally implemented by a Freezer that can explain a degraded
+// but successful freeze (e.g. "quiesce failed, plain snapshot taken").
+type noter interface {
+	Note(g Guest) string
 }
 
 // FreezeSession represents one in-progress freeze operation across a set of
@@ -53,7 +63,7 @@ func FreezeAll(guests []Guest, timeout time.Duration) *FreezeSession {
 		wg.Add(1)
 		go func(g Guest) {
 			defer wg.Done()
-			res := GuestResult{VMID: g.VMID, Type: g.Type, Platform: g.Platform}
+			res := GuestResult{VMID: g.VMID, Name: g.Name, Type: g.Type, Platform: g.Platform}
 
 			f, err := For(g)
 			if err != nil {
@@ -73,6 +83,12 @@ func FreezeAll(guests []Guest, timeout time.Duration) *FreezeSession {
 				res.Warning = "no freeze method available for this guest - snapshotting as-is (crash-consistent only)"
 			default:
 				res.Frozen = true
+			}
+			if n, ok := f.(noter); ok && res.Frozen {
+				res.Warning = n.Note(g)
+			}
+			if h, ok := f.(interface{ SnapID(g Guest) string }); ok {
+				res.SnapID = h.SnapID(g)
 			}
 
 			mu.Lock()
@@ -137,4 +153,15 @@ func (s *FreezeSession) findResult(vmid int) int {
 // FreezeAll and/or Thaw.
 func (s *FreezeSession) Results() []GuestResult {
 	return s.results
+}
+
+// RestoreSession rebuilds a session for guests that an earlier process froze
+// (cs-freeze4snap freeze ... / thaw ...), so that Thaw() can undo it.
+func RestoreSession(guests []Guest) *FreezeSession {
+	s := &FreezeSession{}
+	for _, g := range guests {
+		s.results = append(s.results, GuestResult{VMID: g.VMID, Name: g.Name, Type: g.Type, Platform: g.Platform, Frozen: true})
+		s.frozen = append(s.frozen, g)
+	}
+	return s
 }

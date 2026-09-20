@@ -3,3 +3,4 @@
 /cs-freeze4snap-linux-*
 /checksums.sha256
 *.test
+/dist/

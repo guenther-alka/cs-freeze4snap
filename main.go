@@ -21,10 +21,11 @@ import (
 	"os"
 	"time"
 
+	"cs-freeze4snap/esxi"
 	"cs-freeze4snap/freezer"
 )
 
-const version = "1.0.0"
+const version = "1.1.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -35,6 +36,14 @@ func main() {
 	switch os.Args[1] {
 	case "snap":
 		os.Exit(runSnap(os.Args[2:]))
+	case "discover":
+		os.Exit(runDiscoverESXi(os.Args[2:]))
+	case "freeze":
+		os.Exit(runFreezeESXi(os.Args[2:]))
+	case "thaw":
+		os.Exit(runThawESXi(os.Args[2:]))
+	case "cleanup":
+		os.Exit(runCleanupESXi(os.Args[2:]))
 	case "version", "-version", "--version":
 		fmt.Println("cs-freeze4snap", version)
 	case "help", "-h", "--help":
@@ -47,10 +56,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `cs-freeze4snap - consistent ZFS snapshots for Proxmox VM/LXC guests
+	fmt.Fprintln(os.Stderr, `cs-freeze4snap - consistent ZFS snapshots for Proxmox VM/LXC guests and ESXi VMs
 
 Usage:
   cs-freeze4snap snap --dataset <ds> --name <snapname> [options]
+  cs-freeze4snap snap --hypervisor esxi --cfg <file> --dataset <ds> --name <snapname> [options]
+  cs-freeze4snap discover|freeze|thaw|cleanup --cfg <file> ...     (ESXi, see below)
 
 Options for 'snap':
   --dataset string        ZFS dataset to snapshot (required), e.g. rpool/data
@@ -68,7 +79,11 @@ the JSON result to see which guests, if any, were not cleanly frozen.
 
   --forcefreeze             Abort WITHOUT snapshotting if any guest could
                               not be cleanly frozen (default: false - never
-                              aborts, snapshots as-is instead)`)
+                              aborts, snapshots as-is instead)
+
+ESXi (hotsnap of all VMs on an NFS datastore, the tool may run on any machine
+that can reach the ESXi host; the ZFS snapshot is taken locally or by --zfs-cmd):
+`+esxiUsage)
 }
 
 func runSnap(args []string) int {
@@ -80,7 +95,15 @@ func runSnap(args []string) int {
 	includeStr := fs.String("include-only", "", "comma-separated VMIDs, overrides discovery")
 	timeout := fs.Duration("timeout", 30*time.Second, "max time to wait per guest freeze")
 	forceFreeze := fs.Bool("forcefreeze", false, "abort without snapshotting if any guest could not be cleanly frozen")
+	var eo esxiOpts
+	eo.register(fs, true)
 	fs.Parse(args)
+	timeoutSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "timeout" {
+			timeoutSet = true
+		}
+	})
 
 	if *dataset == "" || *name == "" {
 		fmt.Fprintln(os.Stderr, "error: --dataset and --name are required")
@@ -89,6 +112,14 @@ func runSnap(args []string) int {
 	}
 
 	result := runResult{Dataset: *dataset, Snapshot: *name}
+
+	switch eo.hypervisor {
+	case "", "proxmox":
+	case "esxi":
+		return runSnapESXi(&eo, result, *recursive, esxiTimeout(*timeout, timeoutSet), *forceFreeze)
+	default:
+		return result.fail(fmt.Errorf("--hypervisor must be proxmox or esxi, not %q", eo.hypervisor))
+	}
 
 	exclude, err := freezer.ParseIDList(*excludeStr)
 	if err != nil {
@@ -176,6 +207,15 @@ type runResult struct {
 	Warnings []string              `json:"warnings,omitempty"`
 	FreezeMs int64                 `json:"freeze_ms"`
 	Guests   []freezer.GuestResult `json:"guests,omitempty"`
+
+	// ESXi only
+	Hypervisor string         `json:"hypervisor,omitempty"`
+	Transport  string         `json:"transport,omitempty"` // ssh or soap
+	NFSPath    string         `json:"nfs_path,omitempty"`
+	Datastores []string       `json:"datastores,omitempty"`
+	Skipped    []esxi.Skipped `json:"skipped,omitempty"`
+	State      string         `json:"state,omitempty"`   // freeze: state file to hand to thaw
+	Removed    []string       `json:"removed,omitempty"` // cleanup: VM snapshots removed
 }
 
 func emit(r runResult) {
