@@ -11,7 +11,7 @@ func TestParseChain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.String() != "quiesce,memory:120,zfs,30" || !c.ZFS || c.Strict() || c.Timeout != 30*time.Second {
+	if c.String() != "freeze,memory:120,zfs,30" || !c.ZFS || c.Strict() || c.Timeout != 30*time.Second {
 		t.Errorf("chain: %q %+v", c.String(), c)
 	}
 	if c, _ = ParseChain("memory,plain"); !c.Strict() {
@@ -59,7 +59,7 @@ func TestParsePolicyPrecedence(t *testing.T) {
 	if c, _ := p.For(100); c.String() != "memory,zfs" {
 		t.Errorf("vm100: %s", c)
 	}
-	if c, _ := p.For(101); c.String() != "quiesce,plain,zfs" {
+	if c, _ := p.For(101); c.String() != "freeze,plain,zfs" {
 		t.Errorf("star: %s", c)
 	}
 	q, err := ParsePolicy("t", policyCfg, "192.168.2.49")
@@ -69,11 +69,11 @@ func TestParsePolicyPrecedence(t *testing.T) {
 	if c, _ := q.For(100); c.String() != "plain" || !c.Strict() {
 		t.Errorf("other host vm100: %s", c)
 	}
-	if c, _ := q.For(101); c.String() != "quiesce,memory,zfs,30" {
+	if c, _ := q.For(101); c.String() != "freeze,memory,zfs,30" {
 		t.Errorf("global: %s", c)
 	}
 	r, _ := ParsePolicy("t", policyCfg, "10.0.0.1")
-	if c, _ := r.For(100); c.String() != "quiesce,memory,zfs,30" {
+	if c, _ := r.For(100); c.String() != "freeze,memory,zfs,30" {
 		t.Errorf("unlisted host gets the global chain: %s", c)
 	}
 	r.SetOverride(Chain{Steps: []Step{{Kind: StepPlain}}, ZFS: true})
@@ -99,7 +99,7 @@ func TestParsePolicyErrorsAndFlags(t *testing.T) {
 	if c, _ := p.For(5); c.String() != "zfs" {
 		t.Errorf("flag ct5: %s", c)
 	}
-	if c, _ := p.For(7); c.String() != "quiesce,zfs,20" {
+	if c, _ := p.For(7); c.String() != "freeze,zfs,20" {
 		t.Errorf("flag global: %s", c)
 	}
 	// key=value form
@@ -107,7 +107,7 @@ func TestParsePolicyErrorsAndFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := k.For(7); c.String() != "quiesce" {
+	if c, _ := k.For(7); c.String() != "freeze" {
 		t.Errorf("vm7=: %s", c)
 	}
 	if c, _ := k.For(8); c.String() != "memory,zfs" {
@@ -159,7 +159,7 @@ func TestESXiChainMemoryFallback(t *testing.T) {
 	for _, r := range sess.Results() {
 		switch r.VMID {
 		case 10:
-			if !r.Frozen || r.Strategy != StrategyESXiMem || !strings.Contains(r.Warning, "memory snapshot") || r.Chain != "quiesce,memory,zfs" || r.Strict {
+			if !r.Frozen || r.Strategy != StrategyESXiMem || !strings.Contains(r.Warning, "memory snapshot") || r.Chain != "freeze,memory,zfs" || r.Strict {
 				t.Errorf("vm10: %+v", r)
 			}
 		case 11:
@@ -275,27 +275,69 @@ func TestQEMUChainBranches(t *testing.T) {
 	if s, err := q.Freeze(g, time.Second); s != StrategyZFSOnly || err != nil {
 		t.Errorf("zfs only: %q %v", s, err)
 	}
-	withPolicy(t, "[memory,zfs]\n", "") // memory does not exist on Proxmox
-	if s, err := q.Freeze(g, time.Second); s != "" || err == nil {
-		t.Errorf("memory on proxmox: %q %v", s, err)
+	// no qmp socket = the VM is not running: consistent as it stands, even for a strict chain
+	for _, ch := range []string{"[memory,zfs]\n", "[quiesce,pause,zfs,2]\n", "[quiesce,memory]\n"} {
+		withPolicy(t, ch, "")
+		if s, err := q.Freeze(g, time.Second); s != StrategyStopped || err != nil {
+			t.Errorf("stopped vm, chain %q: %q %v", ch, s, err)
+		}
 	}
-	withPolicy(t, "[quiesce,pause,zfs,2]\n", "") // no sockets: nothing works, not an error
-	if s, err := q.Freeze(g, time.Second); s != StrategyNone || err != nil {
-		t.Errorf("no sockets: %q %v", s, err)
+	if n := q.Note(g); !strings.Contains(n, "not running") {
+		t.Errorf("note: %q", n)
 	}
-	if c := q.ChainOf(g); c.String() != "quiesce,pause,zfs,2" {
+	sess := FreezeAll([]Guest{g}, time.Second)
+	if r := sess.Results()[0]; !r.Frozen || r.Strategy != StrategyStopped || len(StrictViolations(sess.Results())) != 0 {
+		t.Errorf("stopped vm in a session: %+v", r)
+	}
+	// a running VM (qmp socket present) whose steps all fail: strategy none
+	run := qmpFile(t, 100)
+	withPolicy(t, "[quiesce,zfs,2]\n", "")
+	if s, err := run.Freeze(g, time.Second); s != StrategyNone || err != nil {
+		t.Errorf("running vm, no qga: %q %v", s, err)
+	}
+	withPolicy(t, "[quiesce,pause,zfs,2]\n", "")
+	if c := q.ChainOf(g); c.String() != "freeze,pause,zfs,2" {
 		t.Errorf("chain: %s", c)
 	}
 }
 
+func TestModeQuiesceKeepsPlainFallback(t *testing.T) {
+	for _, m := range []string{ModeFreeze, ModeQuiesce} {
+		c, ok := ChainOfMode(m)
+		if !ok || c.String() != "freeze,plain,zfs" {
+			t.Errorf("--mode %s: %v %v", m, c, ok)
+		}
+	}
+}
+
+// "freeze" is the name of the step; "quiesce" (VMware wording, used since
+// v1.2.0) and "mem" stay accepted and are written back as freeze / memory.
+func TestFreezeStepAliases(t *testing.T) {
+	for _, in := range []string{"quiesce,mem,zfs", "freeze,memory,zfs", "[QUIESCE:20,mem,zfs]"} {
+		c, err := ParseChain(in)
+		if err != nil {
+			t.Fatalf("%s: %v", in, err)
+		}
+		if got := c.String(); got != "freeze,memory,zfs" && got != "freeze:20,memory,zfs" {
+			t.Errorf("%s -> %s", in, got)
+		}
+	}
+	if _, err := ParseChain("freeze,quiesce"); err == nil {
+		t.Error("freeze and quiesce are the same step: twice must fail")
+	}
+	if _, err := NewESXiFreezer(nil, "freeze", "n"); err != nil {
+		t.Error("mode freeze:", err)
+	}
+}
+
 func TestDefaultChains(t *testing.T) {
-	if c := DefaultChainFor(PlatformProxmoxLXC, TypeLXC); c.String() != "quiesce,zfs" {
+	if c := DefaultChainFor(PlatformProxmoxLXC, TypeLXC); c.String() != "freeze,zfs" {
 		t.Errorf("lxc: %s", c)
 	}
-	if c := DefaultChainFor(PlatformProxmoxQEMU, TypeVM); c.String() != "quiesce,pause,zfs" {
+	if c := DefaultChainFor(PlatformProxmoxQEMU, TypeVM); c.String() != "freeze,memory,zfs" {
 		t.Errorf("qemu: %s", c)
 	}
-	if c := DefaultChainFor(PlatformESXi, TypeVM); c.String() != "quiesce,plain,zfs" {
+	if c := DefaultChainFor(PlatformESXi, TypeVM); c.String() != "freeze,memory,zfs" {
 		t.Errorf("esxi: %s", c)
 	}
 }

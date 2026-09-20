@@ -15,17 +15,21 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
+	"runtime"
+	"strings"
 	"time"
 
 	"cs-freeze4snap/esxi"
 	"cs-freeze4snap/freezer"
 )
 
-const version = "1.2.0"
+const version = "1.3.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -72,6 +76,10 @@ Options for 'snap':
   --timeout duration        Max time to wait per guest freeze step (default 30s,
                               ESXi 120s; overridden by timeouts in a chain)
   --policy 'chain'          Freeze chain, repeatable, see below
+                              (also 'memkeep=N': cap of Proxmox memory snapshots per VM)
+  --pre-snap-cmd 'cmd'      Shell command run after the freeze and right before the
+                              ZFS snapshot (Proxmox: sync /etc/pve into the dataset so
+                              the config holds the memory snapshot); failure = warning
 
 Freeze is always best-effort by default: if a guest can't be frozen for
 any reason (no guest agent, Proxmox/QMP not responding, unsupported
@@ -97,6 +105,7 @@ func runSnap(args []string) int {
 	includeStr := fs.String("include-only", "", "comma-separated VMIDs, overrides discovery")
 	timeout := fs.Duration("timeout", 30*time.Second, "max time to wait per guest freeze")
 	forceFreeze := fs.Bool("forcefreeze", false, "abort without snapshotting if any guest could not be cleanly frozen")
+	preSnap := fs.String("pre-snap-cmd", "", "shell command run after the freeze, right before the ZFS snapshot (Proxmox); a failure is only a warning")
 	var eo esxiOpts
 	eo.register(fs, true)
 	fs.Parse(args)
@@ -138,6 +147,8 @@ func runSnap(args []string) int {
 		return result.fail(err)
 	}
 
+	freezer.SetSnapName(*name) // names the Proxmox memory snapshot (qm.go)
+
 	guests, err := freezer.DiscoverProxmoxGuests(*dataset)
 	if err != nil {
 		return result.fail(fmt.Errorf("discovery: %w", err))
@@ -174,6 +185,15 @@ func runSnap(args []string) int {
 		return result.fail(abortError(unfrozen, *forceFreeze))
 	}
 
+	// e.g. sync /etc/pve into the dataset: only now does the VM config hold the
+	// memory snapshot that the freeze step just took. Never blocks the snapshot.
+	if *preSnap != "" {
+		if w := runPreSnap(*preSnap, 120*time.Second); w != "" {
+			fmt.Fprintln(os.Stderr, "WARNING:", w)
+			result.Warnings = append(result.Warnings, w)
+		}
+	}
+
 	// Default path (and --forcefreeze once every guest froze cleanly):
 	// freeze is best-effort and never blocks the snapshot on its own.
 	snapErr := freezer.Snapshot(*dataset, *name, *recursive)
@@ -196,6 +216,34 @@ func runSnap(args []string) int {
 	result.Status = "ok"
 	emit(result)
 	return 0
+}
+
+// runPreSnap runs the --pre-snap-cmd; the result is a warning text, "" if it worked.
+func runPreSnap(cmdline string, timeout time.Duration) string {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var c *exec.Cmd
+	if runtime.GOOS == "windows" {
+		c = exec.CommandContext(ctx, "cmd", "/C", cmdline)
+	} else {
+		c = exec.CommandContext(ctx, "sh", "-c", cmdline)
+	}
+	c.WaitDelay = 2 * time.Second // a child that keeps the pipe open must not hold us up
+	out, err := c.CombinedOutput()
+	if err == nil {
+		return ""
+	}
+	last := strings.TrimSpace(string(out))
+	if i := strings.LastIndex(last, "\n"); i >= 0 {
+		last = strings.TrimSpace(last[i+1:])
+	}
+	if len(last) > 200 {
+		last = last[:200]
+	}
+	if ctx.Err() != nil {
+		return fmt.Sprintf("pre-snap-cmd timed out after %ds - snapshot taken anyway", int(timeout/time.Second))
+	}
+	return fmt.Sprintf("pre-snap-cmd failed: %v: %s - snapshot taken anyway", err, last)
 }
 
 // abortList lists the guests that stop the run before the ZFS snapshot: any

@@ -37,11 +37,11 @@ const esxiUsage = `  --hypervisor esxi        (snap only) hotsnap ESXi VMs inste
   --nfs-path path          NFS export path as ESXi mounts it (default: mountpoint of --dataset)
   --nfs-server host        NFS server as ESXi knows it, needed if the path is exported twice
   --vms all|id,name,...    which VMs on that NFS (default all; --snap is an alias)
-  --mode quiesce|mem|plain shortcut for a chain that applies to every VM: quiesce = quiesce,plain,zfs;
+  --mode freeze|mem|plain  shortcut for a chain that applies to every VM: freeze = freeze,plain,zfs;
                              mem = memory,plain,zfs; plain = plain,zfs (default: the chains of the cfg
-                             file, else quiesce,plain,zfs)
-  --policy 'chain'         freeze chain, repeatable: '[quiesce,memory,zfs,30]' for every guest,
-                             'vm100,memory,zfs' for one VM ('*' for all). Steps: quiesce, memory,
+                             file, else freeze,memory,zfs; quiesce is an alias of freeze)
+  --policy 'chain'         freeze chain, repeatable: '[freeze,memory,zfs,30]' for every guest,
+                             'vm100,memory,zfs' for one VM ('*' for all). Steps: freeze, memory,
                              plain, pause (Proxmox VM), zfs; a number is a timeout in seconds,
                              'step:60' one step's. Without zfs at the end the chain is strict: a guest
                              that cannot be frozen aborts the run before the ZFS snapshot.
@@ -96,8 +96,8 @@ func (o *esxiOpts) register(fs *flag.FlagSet, withHypervisor bool) {
 	fs.StringVar(&o.nfsServer, "nfs-server", "", "NFS server as ESXi knows it")
 	fs.StringVar(&o.vms, "vms", "all", "all or comma list of VM ids/names")
 	fs.StringVar(&o.vms, "snap", "all", "alias of --vms")
-	fs.StringVar(&o.mode, "mode", "", "quiesce, mem or plain (a chain for every VM)")
-	fs.Var(&o.policy, "policy", "freeze chain, repeatable: '[quiesce,memory,zfs,30]' or 'vm100,memory,zfs'")
+	fs.StringVar(&o.mode, "mode", "", "freeze, mem or plain (a chain for every VM)")
+	fs.Var(&o.policy, "policy", "freeze chain, repeatable: '[freeze,memory,zfs,30]' or 'vm100,memory,zfs'")
 	fs.BoolVar(&o.allowMixed, "allow-mixed", false, "also snapshot VMs with disks on other datastores")
 	fs.BoolVar(&o.includeOff, "include-off", false, "also snapshot powered-off/suspended VMs")
 	fs.DurationVar(&o.thawTimeout, "thaw-timeout", 2*time.Minute, "max time to remove one VM snapshot")
@@ -128,7 +128,7 @@ func (o *esxiOpts) loadPolicy(host string) error {
 	if o.mode != "" {
 		c, ok := freezer.ChainOfMode(o.mode)
 		if !ok {
-			return fmt.Errorf("--mode must be quiesce, mem or plain, not %q", o.mode)
+			return fmt.Errorf("--mode must be freeze, mem or plain, not %q", o.mode)
 		}
 		p.SetOverride(c)
 	}

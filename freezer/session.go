@@ -30,7 +30,7 @@ type GuestResult struct {
 	// SnapID is the VM snapshot that stands in for the freeze (ESXi): the
 	// handle "thaw" needs to remove it again.
 	SnapID string `json:"snap_id,omitempty"`
-	// Chain is the freeze chain that applied to this guest ("quiesce,memory,zfs,30"),
+	// Chain is the freeze chain that applied to this guest ("freeze,memory,zfs,30"),
 	// Strict that it had no zfs fallback: a guest that is not Frozen then aborts the run.
 	Chain  string `json:"chain,omitempty"`
 	Strict bool   `json:"strict,omitempty"`
@@ -42,7 +42,7 @@ type chainer interface {
 }
 
 // noter is optionally implemented by a Freezer that can explain a degraded
-// but successful freeze (e.g. "quiesce failed, plain snapshot taken").
+// but successful freeze (e.g. "freeze failed, plain snapshot taken").
 type noter interface {
 	Note(g Guest) string
 }

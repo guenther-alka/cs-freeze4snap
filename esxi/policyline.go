@@ -11,10 +11,11 @@ import (
 // package) and per-host connection options; the connection parsers skip the
 // first and read the second:
 //
-//	[quiesce,memory,zfs,30]              global chain
+//	[freeze,memory,zfs,30]              global chain
 //	192.168.2.48:vm100,memory,zfs        chain of one VM
 //	192.168.2.48:proto=ssh               connection option of one host
-//	chain=memory,zfs / vm100=quiesce     the same in the key=value form
+//	chain=memory,zfs / vm100=freeze     the same in the key=value form
+//	memkeep=3 / 192.168.2.112:memkeep=3  cap of Proxmox memory snapshots per VM
 
 // isPolicyLine reports whether a cfg line is a chain line or a "host:option" line.
 func isPolicyLine(t string) bool {
@@ -31,7 +32,7 @@ func isPolicyLine(t string) bool {
 	}
 	if i := strings.Index(t, "="); i > 0 {
 		k := strings.ToLower(strings.TrimSpace(t[:i]))
-		if k == "chain" {
+		if k == "chain" || k == "memkeep" {
 			return true
 		}
 		if strings.HasPrefix(k, "vm") || strings.HasPrefix(k, "ct") {

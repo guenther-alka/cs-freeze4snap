@@ -4,15 +4,17 @@ package freezer
 // how long each may take. Written as a "chain" in the cfg file (or with
 // --policy flags):
 //
-//	[quiesce,memory,zfs,30]              global default for every guest
+//	[freeze,memory,zfs,30]               global default for every guest
 //	192.168.2.48:vm100,memory,zfs        one VM on one server
-//	192.168.2.48:*,quiesce,plain         every VM on one server
+//	192.168.2.48:*,freeze,plain          every VM on one server
 //
 // Steps are tried from left to right, the first that works wins:
 //
-//	quiesce   ESXi: VM snapshot with the guest filesystem quiesced by VMware Tools
-//	          Proxmox: QEMU guest agent fsfreeze / LXC fsfreeze (alias: freeze)
+//	freeze    ESXi: VM snapshot with the guest filesystem quiesced by VMware Tools
+//	          Proxmox: QEMU guest agent fsfreeze / LXC fsfreeze (alias: quiesce)
 //	memory    ESXi: VM snapshot with the RAM state (hot snapshot, slow)   (alias: mem)
+//	          Proxmox VM: qm snapshot with the RAM state; it is NOT removed after the
+//	          ZFS snapshot but kept as long as that ZFS snapshot exists (see qm.go)
 //	plain     ESXi: VM snapshot of the disks only (crash-consistent)
 //	pause     Proxmox QEMU: QMP stop/cont (the whole VM is paused)
 //	zfs       give up on VM/guest freezing, take the ZFS snapshot as it is
@@ -33,7 +35,7 @@ import (
 
 // Step kinds of a chain.
 const (
-	StepQuiesce = "quiesce"
+	StepQuiesce = "freeze"
 	StepMemory  = "memory"
 	StepPlain   = "plain"
 	StepPause   = "pause"
@@ -56,7 +58,7 @@ type Chain struct {
 // Strict reports that the guest must be frozen, or the run aborts.
 func (c Chain) Strict() bool { return !c.ZFS }
 
-// String is the canonical text form, e.g. "quiesce,memory:120,zfs,30".
+// String is the canonical text form, e.g. "freeze,memory:120,zfs,30".
 func (c Chain) String() string {
 	var p []string
 	for _, s := range c.Steps {
@@ -95,7 +97,7 @@ func (c Chain) StepsFor(p Platform) (steps []Step, unsupported []string) {
 		case PlatformESXi:
 			ok = s.Kind == StepQuiesce || s.Kind == StepMemory || s.Kind == StepPlain
 		case PlatformProxmoxQEMU:
-			ok = s.Kind == StepQuiesce || s.Kind == StepPause
+			ok = s.Kind == StepQuiesce || s.Kind == StepPause || s.Kind == StepMemory
 		case PlatformProxmoxLXC:
 			ok = s.Kind == StepQuiesce
 		}
@@ -110,15 +112,21 @@ func (c Chain) StepsFor(p Platform) (steps []Step, unsupported []string) {
 
 // Built-in chains, used when no policy line names the guest.
 var (
-	DefaultESXiChain    = Chain{Steps: []Step{{Kind: StepQuiesce}, {Kind: StepPlain}}, ZFS: true}
-	DefaultProxmoxChain = Chain{Steps: []Step{{Kind: StepQuiesce}, {Kind: StepPause}}, ZFS: true}
+	// freeze, else a memory snapshot (RAM state kept, safe to restore without any
+	// guest tools), else the ZFS snapshot as it is. plain and pause only give
+	// crash-consistent points and have to be asked for.
+	DefaultESXiChain    = Chain{Steps: []Step{{Kind: StepQuiesce}, {Kind: StepMemory}}, ZFS: true}
+	DefaultProxmoxChain = Chain{Steps: []Step{{Kind: StepQuiesce}, {Kind: StepMemory}}, ZFS: true}
+
+	// modeFreezeChain is what "--mode freeze" (= quiesce, the v1.1.0 default) stands for.
+	modeFreezeChain = Chain{Steps: []Step{{Kind: StepQuiesce}, {Kind: StepPlain}}, ZFS: true}
 )
 
-// ChainOfMode maps the --mode flag (quiesce, mem, plain) to a chain.
+// ChainOfMode maps the --mode flag (freeze, mem, plain) to a chain.
 func ChainOfMode(mode string) (Chain, bool) {
 	switch mode {
-	case ModeQuiesce:
-		return DefaultESXiChain, true
+	case ModeQuiesce, ModeFreeze:
+		return modeFreezeChain, true
 	case ModeMem:
 		return Chain{Steps: []Step{{Kind: StepMemory}, {Kind: StepPlain}}, ZFS: true}, true
 	case ModePlain:
@@ -127,7 +135,7 @@ func ChainOfMode(mode string) (Chain, bool) {
 	return Chain{}, false
 }
 
-// ParseChain parses "quiesce,memory:120,zfs,30" (a surrounding [ ] is allowed).
+// ParseChain parses "freeze,memory:120,zfs,30" (a surrounding [ ] is allowed).
 func ParseChain(s string) (Chain, error) {
 	s = strings.TrimSpace(s)
 	s = strings.TrimSuffix(strings.TrimPrefix(s, "["), "]")
@@ -155,7 +163,7 @@ func ParseChain(s string) (Chain, error) {
 			to = d
 		}
 		switch name {
-		case "freeze":
+		case "quiesce": // VMware wording, accepted since v1.2.0
 			name = StepQuiesce
 		case "mem":
 			name = StepMemory
@@ -163,7 +171,7 @@ func ParseChain(s string) (Chain, error) {
 		switch name {
 		case StepQuiesce, StepMemory, StepPlain, StepPause, StepZFS:
 		default:
-			return Chain{}, fmt.Errorf("chain %q: unknown step %q (quiesce, memory, plain, pause, zfs)", s, name)
+			return Chain{}, fmt.Errorf("chain %q: unknown step %q (freeze, memory, plain, pause, zfs)", s, name)
 		}
 		if seen[name] {
 			return Chain{}, fmt.Errorf("chain %q: step %s twice", s, name)
@@ -200,6 +208,10 @@ type Policy struct {
 	star     *Chain
 	perVM    map[int]Chain
 	override *Chain // --mode: wins over everything
+
+	// memkeep: at most N Proxmox memory snapshots per VM (0: as many as there
+	// are ZFS snapshots that need them). mkServer (host:memkeep=N, --policy) wins over mkGlobal.
+	mkGlobal, mkServer int
 }
 
 // For resolves the chain of one guest (per VM, then *, then global).
@@ -245,7 +257,24 @@ func (p *Policy) Merge(o *Policy) *Policy {
 	if o.override != nil {
 		p.override = o.override
 	}
+	if o.mkGlobal > 0 {
+		p.mkGlobal = o.mkGlobal
+	}
+	if o.mkServer > 0 {
+		p.mkServer = o.mkServer
+	}
 	return p
+}
+
+// MemKeep is the cap of Proxmox memory snapshots per VM, 0 = no cap.
+func (p *Policy) MemKeep() int {
+	if p == nil {
+		return 0
+	}
+	if p.mkServer > 0 {
+		return p.mkServer
+	}
+	return p.mkGlobal
 }
 
 // Empty reports that no chain is defined at all.
@@ -295,7 +324,7 @@ func IsPolicyLine(t string) bool {
 	}
 	if i := strings.Index(t, "="); i > 0 {
 		k := strings.ToLower(strings.TrimSpace(t[:i]))
-		if k == "chain" {
+		if k == "chain" || k == "memkeep" {
 			return true
 		}
 		if _, star, ok := parseVMSpec(k); ok && !star && (strings.HasPrefix(k, "vm") || strings.HasPrefix(k, "ct")) {
@@ -351,6 +380,18 @@ func parsePolicy(name, text, host string, flags bool) (*Policy, error) {
 			if h != "" && host == "" {
 				continue // host lines are not for --policy flags
 			}
+			if k, v, ok := strings.Cut(rest, "="); ok && strings.EqualFold(strings.TrimSpace(k), "memkeep") {
+				n, err := strconv.Atoi(strings.TrimSpace(v))
+				if err != nil || n < 0 || n > 999 {
+					return bad(fmt.Errorf("bad memkeep %q (0..999, 0 = no cap)", strings.TrimSpace(v)))
+				}
+				if h != "" || flags {
+					p.mkServer = n
+				} else {
+					p.mkGlobal = n
+				}
+				continue
+			}
 			spec, chain, ok := strings.Cut(rest, ",")
 			if !ok {
 				spec, chain, ok = strings.Cut(rest, "=")
@@ -403,6 +444,9 @@ var currentPolicy *Policy
 
 // SetPolicy installs the policy the freezers consult (nil: built-in chains only).
 func SetPolicy(p *Policy) { currentPolicy = p }
+
+// MemKeep is the cap of Proxmox memory snapshots per VM from the policy (0: none).
+func MemKeep() int { return currentPolicy.MemKeep() }
 
 // ChainFor is the chain of guest g: the policy's, else def.
 func ChainFor(g Guest, def Chain) Chain {

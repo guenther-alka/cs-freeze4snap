@@ -74,6 +74,10 @@ cs-freeze4snap snap --dataset <ds> --name <snapname> [options]
   --timeout duration        Max time to wait per guest freeze (default 30s)
   --forcefreeze             Abort WITHOUT snapshotting if any guest could
                               not be cleanly frozen (default: false)
+  --policy 'chain'          Freeze chain, repeatable (see "Freeze chains"), or
+                              'memkeep=N' (cap of Proxmox memory snapshots per VM)
+  --pre-snap-cmd 'cmd'      Shell command run after the freeze, right before the
+                              ZFS snapshot (v1.3.0; failure = warning only)
 ```
 
 Guest discovery is automatic: `cs-freeze4snap` runs `zfs list -r <dataset>`
@@ -125,6 +129,11 @@ against a real Proxmox host this stayed in the low-millisecond range even
 with a mix of VM/LXC guests using different freeze strategies).
 
 ### VMs (QEMU/KVM under Proxmox)
+
+> **Since v1.3.0** the built-in chain of a Proxmox VM is `freeze,memory,zfs`: stage 1 below, then - instead of the
+> QMP pause - a `qm snapshot` with the RAM state (see "Proxmox VMs: the memory step"), then the plain ZFS
+> snapshot. The QMP stop/cont pause (stage 2) is still available as the `pause` step (`[freeze,pause,zfs]`) and is
+> what v1.0.0 - v1.2.0 did by default.
 
 ```
  1. QEMU Guest Agent (QGA) fsfreeze
@@ -295,6 +304,11 @@ VM/CT's `.conf` file), the execution order becomes:
 3. snapshot → one atomic, recursive zfs snapshot -r captures BOTH
 ```
 
+Since v1.3.0, with the Proxmox `memory` step the config is synced **once more** between freeze and snapshot
+(`--pre-snap-cmd`, see "Proxmox VMs: the memory step"): the memory snapshot adds a section to the VM's `.conf`,
+and only the copy taken after it lets `qm rollback` work after a restore. napp-it CS does this by itself and
+adds `/etc/pve` to `include=` automatically for `freeze=proxmox`.
+
 The result: a single snapshot holding the VM/CT **configuration**
 (CPU, RAM, disks, network - whatever was in `/etc/pve` right before the
 freeze window) together with **consistently frozen disk data** for
@@ -327,7 +341,7 @@ takes a VM snapshot of each powered-on VM on the ESXi host (the "freeze"), takes
 the ZFS snapshot, and removes the VM snapshots again (the "thaw"). The ZFS
 snapshot then holds every VM with an embedded ESXi snapshot: after a restore
 (`zfs clone`/`rollback`) revert the VM to that snapshot to get a
-filesystem-consistent (`quiesce`) or running-state (`mem`) image instead of a
+filesystem-consistent (`freeze`) or running-state (`mem`) image instead of a
 crash image.
 
 ```
@@ -427,15 +441,15 @@ credentials would fail again and every failed login counts towards the account l
 force one. The ESXi
 clock is not used (the tool names snapshots itself), so a wrong host clock does no harm.
 
-### Freeze chains (v1.2.0)
+### Freeze chains (v1.2.0, Proxmox memory step and new defaults v1.3.0)
 
 What "freezing" a VM means is a **chain** of steps that are tried from left to right; the first
 step that works wins, the ZFS snapshot is taken afterwards. Every step has its own timeout.
 
 | step | ESXi | Proxmox VM | Proxmox LXC |
 |---|---|---|---|
-| `quiesce` (alias `freeze`) | VM snapshot, guest filesystem quiesced by VMware Tools | QEMU guest agent `fsfreeze` | `fsfreeze`, else cgroup freeze |
-| `memory` (alias `mem`) | VM snapshot including the RAM state (hot snapshot, slower; restoring it resumes the running state) | - | - |
+| `freeze` (alias `quiesce`) | VM snapshot, guest filesystem quiesced by VMware Tools | QEMU guest agent `fsfreeze` | `fsfreeze`, else cgroup freeze |
+| `memory` (alias `mem`) | VM snapshot including the RAM state (hot snapshot, slower; restoring it resumes the running state) | `qm snapshot --vmstate` with the RAM state, kept as long as the ZFS snapshot exists (v1.3.0, see below) | - |
 | `plain` | VM snapshot of the disks only (crash-consistent) | - | - |
 | `pause` | - | QMP `stop`/`cont` (the whole VM is paused) | - |
 | `zfs` | give up freezing, take the ZFS snapshot as it is | same | same |
@@ -447,17 +461,31 @@ own. Without a timeout the `--timeout` value applies (30 s, ESXi 120 s).
 Chains live in the cfg file next to the server list (or in `--policy`):
 
 ```
-[quiesce,memory,zfs,30]              # global default: quiesce, else memory, else ZFS only; 30 s per step
-192.168.2.48:*,quiesce,plain,zfs     # every VM of this ESXi host
+[freeze,memory,zfs,30]               # global default: freeze, else memory, else ZFS only; 30 s per step
+192.168.2.48:*,freeze,plain,zfs      # every VM of this ESXi host
 192.168.2.48:vm100,memory,zfs        # one VM (vm100, ct100 or 100)
-192.168.2.203:vm101,quiesce,memory   # Proxmox member, no zfs at the end -> strict
+192.168.2.203:vm101,freeze,memory    # Proxmox member, no zfs at the end -> strict
 ```
 
 Precedence (strongest first): `--mode`, `--policy`, `host:vmid` line, `host:*` line, global `[...]`,
-built-in default (ESXi `quiesce,plain,zfs`, Proxmox VM `quiesce,pause,zfs`, LXC `quiesce,zfs`).
-`--mode quiesce|mem|plain` stays as a shortcut for one chain for all VMs (`quiesce,plain,zfs` /
+built-in default (**v1.3.0:** ESXi and Proxmox VM `freeze,memory,zfs`, LXC `freeze,zfs`; up to v1.2.0 ESXi was
+`quiesce,plain,zfs` and Proxmox VM `quiesce,pause,zfs`).
+`--mode freeze|mem|plain` stays as a shortcut for one chain for all VMs (`freeze,plain,zfs` /
 `memory,plain,zfs` / `plain,zfs`). `--policy` (repeatable) takes the same lines without the host prefix:
-`--policy '[quiesce,memory,zfs,30]' --policy 'vm100,memory,zfs'`.
+`--policy '[freeze,memory,zfs,30]' --policy 'vm100,memory,zfs'`.
+
+The step was called `quiesce` up to v1.2.0 (VMware wording); `freeze` is the name Proxmox/QEMU use
+(`fsfreeze`). `quiesce` is still accepted everywhere as an alias and is written back as `freeze`.
+
+Why `freeze,memory,zfs`: `freeze` gives a filesystem-consistent point when the guest tools work; when they
+do not (no VMware Tools / no QEMU guest agent) the `memory` snapshot still gives a point that can be
+restored safely, because the RAM state is part of it. `plain` (ESXi) and `pause` (Proxmox) only give
+crash-consistent points and have to be asked for. `memory,freeze,zfs` puts the hot snapshot first (every
+restore point is a running-state point). `freeze,zfs` alone leaves restore points that are only as
+consistent as the guest tools allowed.
+
+A Proxmox VM that is **not running** needs no freeze: it is reported as frozen with strategy `stopped` (a
+note says so) and does not break a strict chain.
 
 **Best effort or strict.** A chain that ends with `zfs` is best effort as before: when every step failed
 the guest is reported not frozen (`guests[].warning`) and the ZFS snapshot is taken anyway. A chain
@@ -465,9 +493,12 @@ the guest is reported not frozen (`guests[].warning`) and the ZFS snapshot is ta
 (exit 1, `status: error`), like `--forcefreeze` but per guest. A chain of only `zfs` takes no VM snapshot
 at all for that guest (strategy `zfs-only`).
 
-**Timeouts.** A step that runs out of time counts as failed and the next step starts. For ESXi the tool
-then removes a snapshot that the host may still have created for the failed step (the host can finish a
-task after the client gave up); if that fails the warning says to run `cleanup`. For Proxmox the timeout
+**Timeouts.** A step that runs out of time counts as failed and the next step starts. With soap the tool
+cancels the vSphere task first (`CancelTask`) and waits until the host has given it up, otherwise the host
+would keep writing the snapshot and answer the next step with "Another task is already in progress". With
+ssh a running `vim-cmd` cannot be cancelled from the outside: the tool removes a snapshot the host may still
+create for the failed step, and if the host is still busy the following step fails too - `cleanup` removes
+what is left. Prefer soap (`--proto auto` does) when you rely on step timeouts. For Proxmox the timeout
 bounds each connection/command of the step. The JSON result shows the chain that applied in
 `guests[].chain`.
 
@@ -479,6 +510,67 @@ aborts).
 The VM snapshots are named `cs4s-<snapshot>-<vmid>` and carry the description
 `cs-freeze4snap`; only such snapshots are ever removed by the tool.
 
+### Proxmox VMs: the `memory` step (v1.3.0)
+
+`freeze` needs the QEMU guest agent inside the guest. Without it (no agent installed, BSD/appliance guests) the
+default chain `freeze,memory,zfs` falls back to `memory`: the tool runs
+
+```
+qm snapshot <vmid> cs4s_<snapshot> --vmstate 1 --description "cs-freeze4snap <snapshot>"
+```
+
+which needs **no guest agent and no guest tools**: `qm` stops the VM for a moment (seconds, depends on the
+RAM size - 4 s for 2 GB in the test), writes the RAM into a `vm-<id>-state-...` volume and snapshots the disks
+at that same point. Restoring it gives a running VM in exactly that state, not a crash.
+
+Differences to ESXi, on purpose:
+
+- The VM snapshot is **not removed** after the ZFS snapshot. On ZFS the consistent state is the pair
+  `vm-<id>-disk-N@cs4s_<snapshot>` + the vmstate volume; removing the VM snapshot would destroy exactly that.
+  The recursive ZFS snapshot (`pool@<snapshot>`) is taken a moment *later* and holds the disks slightly newer
+  than the RAM - the RAM state fits the `cs4s_` snapshot, not the later disk state.
+- The VM snapshot lives as long as the ZFS snapshot named in its description: at the start of every run the
+  tool removes the `cs4s_` snapshots of a VM whose ZFS snapshot is gone (the retention of your snapshot job
+  removed it), with a grace period of 10 minutes for parallel jobs. Only snapshots with the name prefix `cs4s_`
+  **and** the description `cs-freeze4snap ...` are ever touched. A snapshot that is the base of a running
+  restore (its RAM state volume still carries the ZFS snapshot) is kept.
+- `memkeep=N` (global line, `host:memkeep=N` for one Proxmox member, or `--policy 'memkeep=N'`) is an optional
+  cap: at most the newest N memory snapshots per VM are kept, even if their ZFS snapshots still exist
+  (0 = no cap, the default). Proxmox reserves the vmstate volume thick - about 2.2 x the RAM size (4.5 GB for a
+  2 GB VM) - so for RAM-heavy VMs with long retention set `memkeep` (e.g. 3), otherwise retention x RAM is
+  reserved in the pool.
+- A VM that is **not running** counts as consistent: strategy `stopped`, no snapshot is taken.
+- A failed or timed-out `qm snapshot` is removed again (a timed-out one cannot be cancelled cleanly, the Proxmox
+  worker may still finish - the leftover is removed by the next run). The default timeout of the step is 120 s.
+
+**The VM configuration must be part of the ZFS snapshot**, because the memory snapshot is a section of
+`/etc/pve/qemu-server/<id>.conf` and `qm rollback` needs it after a restore. The napp-it CS jobs add `/etc/pve`
+to `include=` automatically for `freeze=proxmox` (see below). When you call the tool yourself, sync it with
+
+```
+cs-freeze4snap snap --dataset tank/vm --name s1 \
+    --pre-snap-cmd 'rsync -a --delete /etc/pve/ /tank/vm/_include/_etc_pve'
+```
+
+`--pre-snap-cmd` runs after the freeze and right before `zfs snapshot` (a normal include sync before the freeze
+would miss the new snapshot section of the config). It runs with `sh -c`, 120 s at most; a failure is only a
+warning in the result.
+
+**Restore** (VM stopped, disks and config back from the ZFS snapshot / replication target):
+
+```
+zfs rollback -r tank/vm/vm-100-disk-0@cs4s_<snapshot>    # every disk of the VM
+qm rollback 100 cs4s_<snapshot>                          # RAM state, VM comes up running
+```
+
+The `zfs rollback -r` first is required: Proxmox refuses `qm rollback` while a newer ZFS snapshot (the
+recursive `@<snapshot>`, later job snapshots) exists on the disk. It only removes ZFS snapshots that are newer
+than the memory snapshot. If the config is gone (new host), copy it back from
+`<dataset>/_include/_etc_pve/qemu-server/<id>.conf` first.
+
+The result of a VM that got a memory snapshot has `strategy: "qm-mem"`, `frozen: true` and a `warning` that
+tells which step failed before and the name of the VM snapshot.
+
 ### Use from napp-it CS jobs
 
 napp-it CS (snap and replication jobs) has one job setting **Freeze VM prior snap** = `off | proxmox | esxi`.
@@ -487,6 +579,9 @@ machine that reaches the ESXi host) and takes the ZFS snapshot on the member bet
 ESXi hosts, logins, protocol (`--proto auto`) and the freeze chains all come from the cfg file
 `_cfg/freeze4snap/freeze4snap.cfg` on the frontend (`_cfg/freeze4snap/freeze4snap.readme` describes it). A failed
 freeze never blocks the job unless a chain is strict; a missing tool or cfg is a hard error.
+For `proxmox` the jobs also make sure that `/etc/pve` is part of the job's `include=` (added when missing; `include=` then
+only names *additional* folders) and pass `--pre-snap-cmd` (re-sync of `/etc/pve` right before the ZFS snapshot) and
+`memkeep=` from the cfg to the tool.
 
 ### Freeze and thaw as separate steps
 
@@ -541,7 +636,7 @@ snapshot (`vim-cmd vmsvc/snapshot.revert <vmid> <snapid> 0`, or in the UI: Snaps
       "type": "vm",            // "vm" | "lxc"
       "platform": "proxmox-qemu",
       "frozen": true,
-      "strategy": "qmp-pause", // "qga" | "qmp-pause" | "fsfreeze" | "cgroup" | "none"
+      "strategy": "qmp-pause", // "qga" | "qmp-pause" | "qm-mem" | "stopped" | "fsfreeze" | "cgroup" | "zfs-only" | "none"
       "thawed": true,
       "warning": "..."         // only present if this guest wasn't cleanly frozen
     }

@@ -79,7 +79,7 @@ func TestLoadPolicyPrecedence(t *testing.T) {
 	g := func(id int) string {
 		return freezer.ChainFor(freezer.Guest{VMID: id, Platform: freezer.PlatformESXi}, freezer.DefaultESXiChain).String()
 	}
-	if g(100) != "plain,zfs" || g(101) != "quiesce,memory,zfs,30" {
+	if g(100) != "plain,zfs" || g(101) != "freeze,memory,zfs,30" {
 		t.Errorf("cfg: %s / %s", g(100), g(101))
 	}
 	o.policy = multiFlag{"vm100,memory,zfs"}

@@ -3,9 +3,12 @@ package freezer
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -24,6 +27,8 @@ const (
 	StrategyQMPPause = "qmp-pause" // QMP stop/cont - whole vCPU paused, no guest cooperation needed
 	StrategyNone     = "none"      // neither worked - snapshotting as-is (crash-consistent only)
 	StrategyZFSOnly  = "zfs-only"  // the chain names no freeze step (chain "zfs"): ZFS snapshot only
+	StrategyStopped  = "stopped"   // the VM is not running (no QMP socket): consistent as it stands
+	// StrategyQMMem (qm.go) is the qm snapshot with RAM state ("memory" step).
 )
 
 // QEMUFreezer freezes/thaws QEMU/KVM VMs, trying progressively weaker but
@@ -64,10 +69,12 @@ type QEMUFreezer struct {
 
 	mu         sync.Mutex
 	strategies map[int]string // vmid -> strategy actually used, for Thaw dispatch
+	memSnaps   map[int]string // vmid -> qm memory snapshot taken in this run
+	notes      map[int]string // vmid -> why a later step had to take over
 }
 
 func init() {
-	Register(&QEMUFreezer{strategies: make(map[int]string)})
+	Register(&QEMUFreezer{strategies: make(map[int]string), memSnaps: make(map[int]string), notes: make(map[int]string)})
 }
 
 func (q *QEMUFreezer) Name() string { return "qemu" }
@@ -114,33 +121,75 @@ func (q *QEMUFreezer) qmpSocketPath(vmid int) string {
 	return fmt.Sprintf("%s/%d.qmp", dir, vmid)
 }
 
-// ChainOf is the chain that applies to g: policy first, then quiesce,pause.
+// ChainOf is the chain that applies to g: policy first, then freeze,pause.
 func (q *QEMUFreezer) ChainOf(g Guest) Chain { return ChainFor(g, DefaultProxmoxChain) }
 
-// Freeze walks the guest's chain (see policy.go): quiesce = QGA fsfreeze, pause
-// = QMP stop, each with its own timeout; the first that works wins.
+// Freeze walks the guest's chain (see policy.go): freeze = QGA fsfreeze, pause
+// = QMP stop, memory = qm snapshot with RAM state (kept, see qm.go), each with
+// its own timeout; the first that works wins.
 func (q *QEMUFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
+	// memory snapshots whose ZFS snapshot is gone (retention) are dropped first
+	pruneMem(g, "", false)
 	ch := q.ChainOf(g)
 	steps, unsupported := ch.StepsFor(PlatformProxmoxQEMU)
 	if len(steps) == 0 {
 		if ch.ZFS && len(unsupported) == 0 {
 			return StrategyZFSOnly, nil
 		}
-		return "", fmt.Errorf("chain %q has no step that works on a Proxmox VM (quiesce, pause)", ch)
+		return "", fmt.Errorf("chain %q has no step that works on a Proxmox VM (freeze, pause)", ch)
 	}
-	for _, st := range steps {
+	// a VM that is not running has nothing to freeze and is consistent as it
+	// stands - even a strict chain (no zfs) must not stop the run for it
+	if _, err := os.Stat(q.qmpSocketPath(g.VMID)); err != nil && errors.Is(err, fs.ErrNotExist) {
+		q.setStrategy(g.VMID, StrategyStopped)
+		q.mu.Lock()
+		if q.notes == nil {
+			q.notes = make(map[int]string)
+		}
+		q.notes[g.VMID] = "vm is not running - nothing to freeze, consistent as it stands"
+		q.mu.Unlock()
+		return StrategyStopped, nil
+	}
+	var fails []string
+	for i, st := range steps {
 		to := ch.StepTimeout(st, timeout)
 		switch st.Kind {
 		case StepQuiesce:
-			if err := q.freezeViaQGA(g.VMID, to); err == nil {
+			err := q.freezeViaQGA(g.VMID, to)
+			if err == nil {
 				q.setStrategy(g.VMID, StrategyQGA)
 				return StrategyQGA, nil
 			}
+			fails = append(fails, "freeze: "+err.Error())
 		case StepPause:
-			if err := q.pauseViaQMP(g.VMID, to); err == nil {
+			err := q.pauseViaQMP(g.VMID, to)
+			if err == nil {
 				q.setStrategy(g.VMID, StrategyQMPPause)
 				return StrategyQMPPause, nil
 			}
+			fails = append(fails, "pause: "+err.Error())
+		case StepMemory:
+			if st.Timeout == 0 && ch.Timeout == 0 && to < defaultMemTimeout {
+				to = defaultMemTimeout
+			}
+			name, err := memSnapshot(g, q.qmpSocketPath(g.VMID), to)
+			if err == nil {
+				q.setStrategy(g.VMID, StrategyQMMem)
+				q.mu.Lock()
+				if q.memSnaps == nil {
+					q.memSnaps = make(map[int]string)
+				}
+				q.memSnaps[g.VMID] = name
+				if i > 0 {
+					if q.notes == nil {
+						q.notes = make(map[int]string)
+					}
+					q.notes[g.VMID] = fmt.Sprintf("%s - took a memory snapshot instead: RAM state kept in %s (qm rollback %d %s)", strings.Join(fails, "; "), name, g.VMID, name)
+				}
+				q.mu.Unlock()
+				return StrategyQMMem, nil
+			}
+			fails = append(fails, "memory: "+err.Error())
 		}
 	}
 
@@ -160,10 +209,28 @@ func (q *QEMUFreezer) Thaw(g Guest) error {
 		return q.thawViaQGA(g.VMID)
 	case StrategyQMPPause:
 		return q.resumeViaQMP(g.VMID)
+	case StrategyQMMem:
+		// The VM snapshot stays (qm.go): it is the consistent restore point of
+		// the ZFS snapshot. Only what is no longer needed is removed.
+		q.mu.Lock()
+		name := q.memSnaps[g.VMID]
+		q.mu.Unlock()
+		_, errs := pruneMem(g, name, true)
+		if len(errs) > 0 {
+			return fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+		return nil
 	default:
 		// StrategyNone (or unknown/never frozen) - nothing to undo.
 		return nil
 	}
+}
+
+// Note explains a degraded freeze (used for the Warning field).
+func (q *QEMUFreezer) Note(g Guest) string {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.notes[g.VMID]
 }
 
 // --- QGA (guest agent) path ---

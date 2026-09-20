@@ -17,7 +17,8 @@ import (
 
 // ESXi modes: what the VM snapshot that stands in for a "freeze" contains.
 const (
-	ModeQuiesce = "quiesce" // VMware Tools flush the guest filesystem first (default)
+	ModeFreeze  = "freeze"  // VMware Tools flush the guest filesystem first
+	ModeQuiesce = "quiesce" // alias of freeze (VMware wording, v1.1.0)
 	ModeMem     = "mem"     // the RAM state is kept too - a hot snapshot
 	ModePlain   = "plain"   // disks only, crash-consistent
 )
@@ -59,14 +60,13 @@ type esxiSnap struct {
 	ID, Name, Strategy, Note string
 }
 
-// NewESXiFreezer creates the freezer; mode is quiesce, mem or plain.
+// NewESXiFreezer creates the freezer; mode is freeze (alias quiesce), mem or plain.
 func NewESXiFreezer(tr esxi.Transport, mode, snapName string) (*ESXiFreezer, error) {
 	switch mode {
-	case "":
-		mode = ModeQuiesce
-	case ModeQuiesce, ModeMem, ModePlain:
+	case "": // the built-in chain (DefaultESXiChain)
+	case ModeFreeze, ModeQuiesce, ModeMem, ModePlain:
 	default:
-		return nil, fmt.Errorf("mode must be quiesce, mem or plain, not %q", mode)
+		return nil, fmt.Errorf("mode must be freeze, mem or plain, not %q", mode)
 	}
 	return &ESXiFreezer{tr: tr, mode: mode, snapName: snapName, ThawTimeout: 2 * time.Minute, snaps: map[int]*esxiSnap{}}, nil
 }
@@ -87,6 +87,9 @@ func (f *ESXiFreezer) vmSnapName(g Guest) string {
 // defaultChain is the chain used for guests no policy line names: what --mode /
 // NewESXiFreezer(mode) stands for.
 func (f *ESXiFreezer) defaultChain() Chain {
+	if f.mode == "" {
+		return DefaultESXiChain
+	}
 	c, _ := ChainOfMode(f.mode)
 	return c
 }
@@ -105,7 +108,7 @@ func esxiStep(kind string) (mem, quiesce bool, strategy, what string) {
 	return false, false, StrategyESXiSnap, "plain"
 }
 
-// Freeze takes the VM snapshot: it walks the guest's chain (quiesce, memory,
+// Freeze takes the VM snapshot: it walks the guest's chain (freeze, memory,
 // plain - see policy.go) and the first step that works wins. Every step gets
 // its own timeout (the step's, else the chain's, else timeout). A step that
 // fails or times out is cleaned up before the next one starts. Without a
@@ -118,7 +121,7 @@ func (f *ESXiFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
 		if ch.ZFS && len(unsupported) == 0 {
 			return StrategyZFSOnly, nil // chain "zfs": no VM snapshot wanted
 		}
-		return "", fmt.Errorf("chain %q has no step that works on ESXi (quiesce, memory, plain)", ch)
+		return "", fmt.Errorf("chain %q has no step that works on ESXi (freeze, memory, plain)", ch)
 	}
 	name := f.vmSnapName(g)
 	var fails []string

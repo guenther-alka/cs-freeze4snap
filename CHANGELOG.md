@@ -1,12 +1,42 @@
 # Changelog
 
+## v1.3.0 - Proxmox memory snapshots, `freeze` as step name, new default chain
+
+- New: the **`memory` step for Proxmox VMs**: `qm snapshot <vmid> cs4s_<snapshot> --vmstate 1` keeps the RAM state,
+  so a restore point is safe without a guest agent or any guest tools (like the ESXi hot snapshot). Unlike ESXi
+  the VM snapshot is **not** removed after the ZFS snapshot: it is the consistent restore point of that ZFS
+  snapshot and lives as long as the ZFS snapshot exists (every run removes the `cs4s_` snapshots of a VM whose
+  ZFS snapshot is gone, 10 minutes grace for parallel jobs). Only snapshots named `cs4s_*` with the description
+  `cs-freeze4snap ...` are ever touched. Strategy `qm-mem`.
+- New: `memkeep=N` (global line, `host:memkeep=N`, or `--policy 'memkeep=N'`): optional cap of memory snapshots
+  per VM (newest N are kept). Default 0 = no cap. Proxmox reserves the vmstate volume thick (about 2.2 x RAM).
+- New: `--pre-snap-cmd 'cmd'`: shell command run after the freeze and right before `zfs snapshot`, 120 s, failure =
+  warning. napp-it CS uses it to sync `/etc/pve` into `<dataset>/_include/_etc_pve` after the memory snapshot was
+  taken, so the copied VM config contains the snapshot section that `qm rollback` needs.
+- Restore: `zfs rollback -r <pool>/vm-N-disk-M@cs4s_<snapshot>` for every disk, then `qm rollback N cs4s_<snapshot>`
+  (verified: the VM starts with `-loadstate`). The first step is needed because Proxmox refuses `qm rollback`
+  while a newer ZFS snapshot exists on the disk. See README "Proxmox VMs: the memory step".
+- New: a Proxmox VM that is **not running** counts as consistent (strategy `stopped`, no snapshot) and does not
+  break a strict chain.
+- Changed: the step is now called **`freeze`** (that is what Proxmox/QEMU call it); `quiesce` (VMware wording, used
+  by v1.2.0) is still accepted as an alias, also for `--mode` (`--mode freeze|mem|plain`). Chains are written back as
+  `freeze`; the strategy `esxi-quiesce` in the JSON is unchanged.
+- Changed: **new built-in default chain `freeze,memory,zfs`** for ESXi and Proxmox VMs (before: ESXi
+  `quiesce,plain,zfs`, Proxmox VM `quiesce,pause,zfs`): a restore point is filesystem-consistent with working guest
+  tools and running-state-consistent without them; `plain`/`pause` (crash-consistent) have to be asked for. LXC stays
+  `freeze,zfs`. `--mode freeze` keeps meaning `freeze,plain,zfs`. To get the old behaviour set
+  `[freeze,plain,zfs]` / `[freeze,pause,zfs]` in the cfg or `--policy`.
+- The Proxmox snapshot timeout of a memory step defaults to 120 s (writing the RAM takes longer than a QGA freeze).
+- Note: `TestSOAPLoginAndPin` fails on Windows (as in v1.1.0/v1.2.0, a test-environment issue); all tests pass on Linux.
+
 ## v1.2.0 - freeze chains with timeouts, proto auto
 
 - New: **freeze chains** per guest, e.g. `[quiesce,memory,zfs,30]`: steps `quiesce`, `memory`, `plain`,
   `pause`, `zfs` are tried from left to right, the first that works wins. `memory` (ESXi) takes a hot
   snapshot including the RAM state when quiesce is not possible (no VMware Tools). Each step has its own
   timeout (`memory:300`, or a bare number for the whole chain); a step that times out counts as failed and
-  the next one starts (ESXi: a snapshot the host may still create for it is removed again).
+  the next one starts (soap: the vSphere task is cancelled; a snapshot the host may still have created is
+  removed again).
 - Chains are set in the cfg file - global `[...]`, per server `host:*,...`, per VM `host:vm100,...` - or with
   `--policy` (repeatable). Precedence: `--mode`, `--policy`, VM, `*`, global, built-in default.
   Steps that do not exist on a platform are skipped.
