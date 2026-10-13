@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.3.1 - guest agent freeze that freezes nothing counts as failed
+
+- Fixed: a Proxmox VM whose guest agent answers `guest-fsfreeze-freeze` with 0 frozen filesystems (qemu-ga on FreeBSD
+  only freezes UFS, so a ZFS-root guest froze nothing) was reported as `frozen: true`. The `freeze` step now fails in
+  that case and the chain goes on with its next step (`memory`, `pause`, `zfs`), the reason is in the warning.
+
 ## v1.3.0 - Proxmox memory snapshots, `freeze` as step name, new default chain
 
 - New: the **`memory` step for Proxmox VMs**: `qm snapshot <vmid> cs4s_<snapshot> --vmstate 1` keeps the RAM state,

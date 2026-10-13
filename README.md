@@ -156,6 +156,8 @@ talks to the QGA/QMP sockets that only exist there.
   ```
 - `freeze` needs `qemu-guest-agent` in the guest. Without it, the chain falls back to `memory` (VM
   snapshot with the RAM) or, if you ask for it, to `pause` (QMP `stop`/`cont`).
+  The same fallback applies when the agent answers but freezes 0 filesystems (qemu-ga on FreeBSD freezes UFS only,
+  not ZFS): that counts as a failed `freeze` step.
 - LXC: `fsfreeze` is applied on the host to the container's mountpoint (that also works for
   unprivileged containers). If the filesystem does not support `FIFREEZE` - OpenZFS often does not,
   check with `fsfreeze -f <mountpoint>` - the tool syncs and freezes the container via cgroup v2.

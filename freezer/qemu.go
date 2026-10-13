@@ -165,6 +165,14 @@ func (q *QEMUFreezer) Freeze(g Guest, timeout time.Duration) (string, error) {
 			err := q.pauseViaQMP(g.VMID, to)
 			if err == nil {
 				q.setStrategy(g.VMID, StrategyQMPPause)
+				if i > 0 {
+					q.mu.Lock()
+					if q.notes == nil {
+						q.notes = make(map[int]string)
+					}
+					q.notes[g.VMID] = strings.Join(fails, "; ") + " - paused the VM instead (crash-consistent)"
+					q.mu.Unlock()
+				}
 				return StrategyQMPPause, nil
 			}
 			fails = append(fails, "pause: "+err.Error())
@@ -252,6 +260,14 @@ func (q *QEMUFreezer) freezeViaQGA(vmid int, timeout time.Duration) error {
 	}
 	if err := jsonRPCCall(conn, timeout, `{"execute":"guest-fsfreeze-freeze"}`, &resp); err != nil {
 		return fmt.Errorf("guest-fsfreeze-freeze failed: %w", err)
+	}
+	if resp.Return == 0 {
+		// the agent answered but froze nothing (e.g. qemu-ga on FreeBSD only freezes UFS, not ZFS):
+		// that is not a freeze, so this step failed and the chain goes on with its next step
+		if err := jsonRPCCall(conn, timeout, `{"execute":"guest-fsfreeze-thaw"}`, nil); err != nil {
+			_ = err // nothing was frozen, a failing thaw is harmless
+		}
+		return fmt.Errorf("guest-fsfreeze-freeze froze 0 filesystems (not supported by the agent for this guest filesystem, e.g. ZFS on FreeBSD)")
 	}
 	return nil
 }

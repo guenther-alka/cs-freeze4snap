@@ -29,7 +29,7 @@ import (
 	"cs-freeze4snap/freezer"
 )
 
-const version = "1.3.0"
+const version = "1.3.1"
 
 func main() {
 	if len(os.Args) < 2 {
